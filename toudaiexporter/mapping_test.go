@@ -125,6 +125,9 @@ func TestRecordMapsRouteEachKindOnce(t *testing.T) {
 	}
 }
 
+// fixtureEventID is a canonical UUIDv7 standing in for the gateway-assigned ID.
+const fixtureEventID = "0198a0c4-7b3e-7c11-8a52-3f6d1e9b2a40"
+
 // fixtureLogs builds one log record with the trusted gateway scope and the
 // supplied record attributes.
 func fixtureLogs(t *testing.T, record func(plog.LogRecord)) plog.Logs {
@@ -140,6 +143,7 @@ func fixtureLogs(t *testing.T, record func(plog.LogRecord)) plog.Logs {
 	sl.Scope().SetName("toudai.fixture")
 	sl.Scope().Attributes().PutStr("scope.attr", "scope-value")
 	lr := sl.LogRecords().AppendEmpty()
+	lr.Attributes().PutStr(eventIDAttr, fixtureEventID)
 	lr.SetTimestamp(pcommon.Timestamp(1788246000123456789))
 	lr.SetObservedTimestamp(pcommon.Timestamp(1788246000123456789 + 1_000_000))
 	lr.Body().SetStr("body")
@@ -166,7 +170,7 @@ func TestPrepareLogsRejectsMissingTrustedScope(t *testing.T) {
 	if len(prepared.rows) != 0 {
 		t.Fatalf("rows = %d, want 0", len(prepared.rows))
 	}
-	if !batchInvalidated(prepared.rejections) {
+	if _, err := batchInvalidation(prepared.rejections); err == nil {
 		t.Fatalf("rejections = %+v, want the batch to be invalidated without the gateway marker", prepared.rejections)
 	}
 }
@@ -220,6 +224,7 @@ func TestSpanTimingStatusAndPreservedTimestamps(t *testing.T) {
 		res.PutStr(scopeSourceAttr, scopeSourceValue)
 		ss := rs.ScopeSpans().AppendEmpty()
 		sp := ss.Spans().AppendEmpty()
+		sp.Attributes().PutStr(eventIDAttr, fixtureEventID)
 		sp.SetStartTimestamp(pcommon.Timestamp(start))
 		sp.SetEndTimestamp(pcommon.Timestamp(end))
 		sp.SetName("span")
@@ -287,29 +292,91 @@ func TestSpanTimingStatusAndPreservedTimestamps(t *testing.T) {
 	}
 }
 
-func TestEventIDIsStableAcrossRetries(t *testing.T) {
-	build := func() preparedLogs {
+// The exporter stores the ID the gateway assigned and never derives one: two
+// records with byte-identical content but different assigned IDs (a producer
+// retry, or two legitimate identical events) keep distinct identities, and the
+// same assigned ID is reproduced exactly.
+func TestEventIDIsTheAssignedOne(t *testing.T) {
+	const other = "0198a0c4-7b3e-7c11-8a52-3f6d1e9b2a41"
+	build := func(id string) preparedLogs {
 		return prepareLogs(fixtureLogs(t, func(lr plog.LogRecord) {
+			lr.Attributes().PutStr(eventIDAttr, id)
 			lr.Attributes().PutInt("metric.value", 1)
-			lr.Attributes().PutDouble("other.value", 1.5)
 		}))
 	}
-	first, second := build(), build()
-	if len(first.rows) != 1 || len(second.rows) != 1 {
-		t.Fatalf("expected one row per build, got %d and %d", len(first.rows), len(second.rows))
+	a, b := build(fixtureEventID), build(other)
+	if len(a.rows) != 1 || len(b.rows) != 1 {
+		t.Fatalf("expected one row per build, got %d and %d", len(a.rows), len(b.rows))
 	}
-	if first.rows[0].EventID != second.rows[0].EventID {
-		t.Fatalf("event identity changed across identical exports: %q vs %q", first.rows[0].EventID, second.rows[0].EventID)
+	if a.rows[0].EventID != fixtureEventID || a.canonical[0].EventID != fixtureEventID {
+		t.Fatalf("serving/canonical event IDs = %q/%q, want the assigned %q", a.rows[0].EventID, a.canonical[0].EventID, fixtureEventID)
 	}
-	if first.rows[0].PayloadSHA256 != second.rows[0].PayloadSHA256 {
-		t.Fatal("payload checksum changed across identical exports")
+	if b.rows[0].EventID != other {
+		t.Fatalf("event ID = %q, want the assigned %q", b.rows[0].EventID, other)
 	}
-	// Different content must produce a different identity.
-	third := prepareLogs(fixtureLogs(t, func(lr plog.LogRecord) {
-		lr.Attributes().PutInt("metric.value", 2)
-	}))
-	if third.rows[0].EventID == first.rows[0].EventID {
-		t.Fatal("different content produced the same event identity")
+	// Content is identical, so only the assigned ID can explain the difference.
+	if a.rows[0].PayloadSHA256 == b.rows[0].PayloadSHA256 {
+		t.Fatal("payload checksum ignored the assigned event ID")
+	}
+	if strings.Contains(a.rows[0].Payload, `"toudai.event_id"`) {
+		t.Fatal("the event ID attribute must be stored as identity only, not as a record attribute")
+	}
+	if _, ok := a.rows[0].RecordString[eventIDAttr]; ok {
+		t.Fatal("the event ID attribute must not be stored in the record Maps")
+	}
+}
+
+func TestEventIDValidation(t *testing.T) {
+	tests := []struct {
+		name       string
+		set        func(plog.LogRecord)
+		wantReason string
+	}{
+		{"missing", func(lr plog.LogRecord) { lr.Attributes().Remove(eventIDAttr) }, "missing_event_id"},
+		{"empty", func(lr plog.LogRecord) { lr.Attributes().PutStr(eventIDAttr, "") }, "missing_event_id"},
+		{"not a string", func(lr plog.LogRecord) { lr.Attributes().PutInt(eventIDAttr, 7) }, "missing_event_id"},
+		{"content hash", func(lr plog.LogRecord) { lr.Attributes().PutStr(eventIDAttr, "lh1-0123456789abcdef0123456789abcdef") }, "invalid_event_id"},
+		{"uuid v4", func(lr plog.LogRecord) { lr.Attributes().PutStr(eventIDAttr, "9d6b2f0e-7d1c-4a55-8f3e-1c2b3a4d5e6f") }, "invalid_event_id"},
+		{"uppercase uuid v7", func(lr plog.LogRecord) { lr.Attributes().PutStr(eventIDAttr, strings.ToUpper(fixtureEventID)) }, "invalid_event_id"},
+		{"unhyphenated uuid v7", func(lr plog.LogRecord) {
+			lr.Attributes().PutStr(eventIDAttr, strings.ReplaceAll(fixtureEventID, "-", ""))
+		}, "invalid_event_id"},
+		{"urn uuid v7", func(lr plog.LogRecord) { lr.Attributes().PutStr(eventIDAttr, "urn:uuid:"+fixtureEventID) }, "invalid_event_id"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			prepared := prepareLogs(fixtureLogs(t, tc.set))
+			if len(prepared.rows) != 0 || len(prepared.canonical) != 0 {
+				t.Fatalf("rows/canonical = %d/%d, want the record rejected", len(prepared.rows), len(prepared.canonical))
+			}
+			if len(prepared.rejections) != 1 || prepared.rejections[0].Reason != tc.wantReason {
+				t.Fatalf("rejections = %+v, want one %s", prepared.rejections, tc.wantReason)
+			}
+			// A bad ID means the gateway processor is misconfigured, so the whole
+			// export fails closed rather than writing its other records.
+			if reason, err := batchInvalidation(prepared.rejections); err == nil || reason != tc.wantReason {
+				t.Fatalf("batchInvalidation = %q, %v, want %s", reason, err, tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestSpansRequireAssignedEventID(t *testing.T) {
+	td := ptrace.NewTraces()
+	rs := td.ResourceSpans().AppendEmpty()
+	res := rs.Resource().Attributes()
+	res.PutStr(workspaceAttr, "ws")
+	res.PutStr(datasetAttr, "fixture")
+	res.PutStr(scopeSourceAttr, scopeSourceValue)
+	spans := rs.ScopeSpans().AppendEmpty().Spans()
+	spans.AppendEmpty().Attributes().PutStr(eventIDAttr, fixtureEventID)
+	spans.AppendEmpty() // no event ID
+	prepared := prepareSpans(td)
+	if len(prepared.rows) != 1 || prepared.rows[0].EventID != fixtureEventID {
+		t.Fatalf("rows = %+v, want only the span with an assigned ID", prepared.rows)
+	}
+	if reason, err := batchInvalidation(prepared.rejections); err == nil || reason != "missing_event_id" {
+		t.Fatalf("batchInvalidation = %q, %v, want missing_event_id", reason, err)
 	}
 }
 

@@ -58,6 +58,8 @@ type Config struct {
 
 var (
 	errMissingTrustedScope = errors.New("trusted scope is missing: the gateway must inject the toudai workspace/dataset attributes before the exporter")
+	errMissingEventID      = errors.New("event_id is missing: the gateway processor must assign a toudai.event_id to every record before the exporter")
+	errInvalidEventID      = errors.New("event_id is not a canonical UUIDv7")
 )
 
 func defaultConfig() *Config {

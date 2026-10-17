@@ -11,21 +11,27 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+
+	"github.com/toudai-dev/collector/internal/reserved"
 )
 
-// Reserved attribute keys. The gateway's resource processor is the only place
-// trusted scope is injected; every reserved key that arrives in a
+// Reserved attribute keys. The gateway processor is the only place trusted scope
+// and event identity are injected; every reserved key that arrives in a
 // producer-controlled namespace (record, scope, span, span scope) is dropped and
-// counted, and the internal scope-source marker is never stored.
+// counted, and the internal scope-source marker is never stored. The gateway
+// event ID is read from the record before that drop and stored only as the
+// event_id column and identity field.
 const (
-	workspaceAttr    = "toudai.workspace_id"
-	datasetAttr      = "toudai.dataset"
-	scopeSourceAttr  = "toudai.scope_source"
-	scopeSourceValue = "gateway"
-	reservedPrefix   = "toudai."
+	workspaceAttr    = reserved.WorkspaceAttr
+	datasetAttr      = reserved.DatasetAttr
+	scopeSourceAttr  = reserved.ScopeSourceAttr
+	scopeSourceValue = reserved.ScopeSourceValue
+	eventIDAttr      = reserved.EventIDAttr
+	reservedPrefix   = reserved.Prefix
 )
 
 const canonicalSchema = "toudai.canonical.event/1"
@@ -272,17 +278,23 @@ func marshalCanonical(doc map[string]any) (string, error) {
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
 
-// eventID is a stable, content-derived fixture-scale identity: retries and
-// re-batching of the same record produce the same ID, which is what lets the
-// harness correlate canonical and serving rows and tell canonical duplicates
-// apart from missing serving rows. It is not a deduplication mechanism and does
-// not yet implement Decision 0001's gateway-assigned identity.
-func eventID(kind, workspace, dataset string, ts, observed uint64, traceID, spanID, payloadWithoutID string) string {
-	h := sha256.New()
-	// Writes to a hash.Hash never return an error.
-	_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00%d\x00%d\x00%s\x00%s\x00", kind, workspace, dataset, ts, observed, traceID, spanID)
-	_, _ = h.Write([]byte(payloadWithoutID))
-	return "lh1-" + hex.EncodeToString(h.Sum(nil))[:32]
+// assignedEventID reads the gateway-assigned event_id from a record's attributes.
+// The exporter never derives an identity: a record without a valid UUIDv7 means
+// the pipeline skipped the gateway processor (or something rewrote the ID), so
+// the record is rejected rather than given a substitute. IDs are not
+// deduplicated; a retry that reuses an ID writes it twice (Decision 0001 D5).
+func assignedEventID(m pcommon.Map) (string, error) {
+	v, ok := m.Get(eventIDAttr)
+	if !ok || v.Type() != pcommon.ValueTypeStr || v.Str() == "" {
+		return "", errMissingEventID
+	}
+	id, err := uuid.Parse(v.Str())
+	// Parse also accepts urn:, braces, and unhyphenated forms; the stored form is
+	// always the canonical lowercase one so lookups by event_id stay exact.
+	if err != nil || id.Version() != 7 || id.Variant() != uuid.RFC4122 || id.String() != v.Str() {
+		return "", errInvalidEventID
+	}
+	return v.Str(), nil
 }
 
 func hexTraceID(id pcommon.TraceID) string {
@@ -492,6 +504,16 @@ func resourceForStorage(res attrs) (values map[string]value, strings_, types map
 	return values, strings_, types, dropped
 }
 
+func eventIDRejection(err error) rejection {
+	reason := "invalid_event_id"
+	if err == errMissingEventID {
+		reason = "missing_event_id"
+	}
+	// The detail never echoes the offending value: it came from outside the
+	// gateway and could be anything a producer chose to put there.
+	return rejection{Reason: reason, Detail: err.Error(), Namespace: "record"}
+}
+
 func prepareLogs(ld plog.Logs) preparedLogs {
 	var out preparedLogs
 	rls := ld.ResourceLogs()
@@ -519,6 +541,11 @@ func prepareLogs(ld plog.Logs) preparedLogs {
 			logs := sl.LogRecords()
 			for k := 0; k < logs.Len(); k++ {
 				lr := logs.At(k)
+				eventID, err := assignedEventID(lr.Attributes())
+				if err != nil {
+					out.rejections = append(out.rejections, eventIDRejection(err))
+					continue
+				}
 				rec, err := decodeAttrs(lr.Attributes(), true)
 				if err != nil {
 					out.rejections = append(out.rejections, rejection{Reason: "duplicate_or_invalid_record_attributes", Detail: err.Error(), Namespace: "record"})
@@ -557,6 +584,7 @@ func prepareLogs(ld plog.Logs) preparedLogs {
 				}
 				canonical, err := buildCanonical(canonicalInput{
 					kind:        "log",
+					eventID:     eventID,
 					workspace:   workspace,
 					dataset:     dataset,
 					tsRaw:       tsRaw,
@@ -635,6 +663,11 @@ func prepareSpans(td ptrace.Traces) preparedSpans {
 			spans := ss.Spans()
 			for k := 0; k < spans.Len(); k++ {
 				sp := spans.At(k)
+				eventID, err := assignedEventID(sp.Attributes())
+				if err != nil {
+					out.rejections = append(out.rejections, eventIDRejection(err))
+					continue
+				}
 				rec, err := decodeAttrs(sp.Attributes(), true)
 				if err != nil {
 					out.rejections = append(out.rejections, rejection{Reason: "duplicate_or_invalid_span_attributes", Detail: err.Error(), Namespace: "span"})
@@ -683,6 +716,7 @@ func prepareSpans(td ptrace.Traces) preparedSpans {
 				}
 				canonical, err := buildCanonical(canonicalInput{
 					kind:        "span",
+					eventID:     eventID,
 					workspace:   workspace,
 					dataset:     dataset,
 					tsRaw:       start,
@@ -759,6 +793,7 @@ type spanEnvelope struct {
 
 type canonicalInput struct {
 	kind         string
+	eventID      string
 	workspace    string
 	dataset      string
 	tsRaw        uint64
@@ -782,7 +817,8 @@ type canonicalDoc struct {
 // buildCanonical produces the versioned post-policy canonical payload. It
 // extends Experiment 019's namespace/value encoding with the envelope fields the
 // harness needs to reconstruct the serving row; Experiment 019 explicitly did
-// not propose its payload encoding as the final wire format.
+// not propose its payload encoding as the final wire format. The event identity
+// is the gateway-assigned one carried in the input, not derived from content.
 func buildCanonical(in canonicalInput) (canonicalDoc, error) {
 	doc := map[string]any{
 		"schema": canonicalSchema,
@@ -790,7 +826,7 @@ func buildCanonical(in canonicalInput) (canonicalDoc, error) {
 		"identity": map[string]any{
 			"tenant_id": in.workspace,
 			"dataset":   in.dataset,
-			"event_id":  "",
+			"event_id":  in.eventID,
 		},
 		"time": map[string]any{
 			"timestamp_ns": strconv.FormatUint(in.tsRaw, 10),
@@ -822,18 +858,10 @@ func buildCanonical(in canonicalInput) (canonicalDoc, error) {
 		doc["span"] = span
 	}
 
-	// Identity is content-derived: encode once with an empty event id, hash it,
-	// then re-encode with the derived id.
-	pre, err := marshalCanonical(doc)
-	if err != nil {
-		return canonicalDoc{}, err
-	}
-	id := eventID(in.kind, in.workspace, in.dataset, in.tsRaw, in.observedRaw, in.traceID, in.spanID, pre)
-	doc["identity"].(map[string]any)["event_id"] = id
 	payload, err := marshalCanonical(doc)
 	if err != nil {
 		return canonicalDoc{}, err
 	}
 	sum := sha256.Sum256([]byte(payload))
-	return canonicalDoc{eventID: id, payload: payload, sha256: hex.EncodeToString(sum[:])}, nil
+	return canonicalDoc{eventID: in.eventID, payload: payload, sha256: hex.EncodeToString(sum[:])}, nil
 }

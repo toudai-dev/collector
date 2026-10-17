@@ -74,9 +74,9 @@ func (e *toudaiExporter) pushLogs(ctx context.Context, ld plog.Logs) error {
 		}
 		return nil
 	}
-	if batchInvalidated(prepared.rejections) {
-		e.metrics.rejectedBatches.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", "logs"), attribute.String("reason", "missing_trusted_scope")))
-		return consumererror.NewPermanent(errMissingTrustedScope)
+	if reason, err := batchInvalidation(prepared.rejections); err != nil {
+		e.metrics.rejectedBatches.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", "logs"), attribute.String("reason", reason)))
+		return consumererror.NewPermanent(err)
 	}
 	e.logBatchSummary(ctx, "logs", len(prepared.rows), prepared.rejections, logWorkspaces(prepared.rows), logEventIDs(prepared.rows))
 	if err := e.insertCanonical(ctx, prepared.canonical); err != nil {
@@ -106,9 +106,9 @@ func (e *toudaiExporter) pushTraces(ctx context.Context, td ptrace.Traces) error
 		}
 		return nil
 	}
-	if batchInvalidated(prepared.rejections) {
-		e.metrics.rejectedBatches.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", "spans"), attribute.String("reason", "missing_trusted_scope")))
-		return consumererror.NewPermanent(errMissingTrustedScope)
+	if reason, err := batchInvalidation(prepared.rejections); err != nil {
+		e.metrics.rejectedBatches.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", "spans"), attribute.String("reason", reason)))
+		return consumererror.NewPermanent(err)
 	}
 	e.logBatchSummary(ctx, "spans", len(prepared.rows), prepared.rejections, spanWorkspaces(prepared.rows), spanEventIDs(prepared.rows))
 	if err := e.insertCanonical(ctx, prepared.canonical); err != nil {
@@ -125,13 +125,21 @@ func (e *toudaiExporter) pushTraces(ctx context.Context, td ptrace.Traces) error
 	return nil
 }
 
-func batchInvalidated(rejections []rejection) bool {
+// batchInvalidation reports whether any rejection means the pipeline itself is
+// misconfigured (the gateway processor did not run, or its output was altered)
+// rather than that one producer record is bad. Those fail the whole batch.
+func batchInvalidation(rejections []rejection) (reason string, err error) {
 	for _, r := range rejections {
-		if r.Reason == "missing_trusted_scope" {
-			return true
+		switch r.Reason {
+		case "missing_trusted_scope":
+			return r.Reason, errMissingTrustedScope
+		case "missing_event_id":
+			return r.Reason, errMissingEventID
+		case "invalid_event_id":
+			return r.Reason, errInvalidEventID
 		}
 	}
-	return false
+	return "", nil
 }
 
 func (e *toudaiExporter) recordRejections(ctx context.Context, signal string, rejections []rejection) {

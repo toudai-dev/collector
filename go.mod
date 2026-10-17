@@ -34,6 +34,7 @@ require (
 )
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/exporter/clickhouseexporter v0.161.0
 	github.com/open-telemetry/opentelemetry-collector-contrib/processor/transformprocessor v0.161.0
 	go.opentelemetry.io/collector/service v0.161.0
@@ -98,7 +99,6 @@ require (
 	github.com/golang/snappy v1.0.0 // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.18 // indirect
 	github.com/googleapis/gax-go/v2 v2.23.0 // indirect
 	github.com/grafana/regexp v0.0.0-20250905093917-f7b3be9d1853 // indirect
