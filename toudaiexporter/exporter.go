@@ -148,10 +148,7 @@ func (e *toudaiExporter) recordRejections(ctx context.Context, signal string, re
 }
 
 func (e *toudaiExporter) logBatchSummary(ctx context.Context, signal string, records int, rejections []rejection, workspaces, eventIDs []string) {
-	mixed := false
-	if len(workspaces) > 1 {
-		mixed = true
-	}
+	mixed := len(workspaces) > 1
 	e.metrics.batches.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", signal), attribute.Bool("cross_workspace", mixed)))
 	if !e.cfg.LogBatchSummaries {
 		return

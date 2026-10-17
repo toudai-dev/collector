@@ -279,8 +279,9 @@ func marshalCanonical(doc map[string]any) (string, error) {
 // not yet implement Decision 0001's gateway-assigned identity.
 func eventID(kind, workspace, dataset string, ts, observed uint64, traceID, spanID, payloadWithoutID string) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s\x00%s\x00%s\x00%d\x00%d\x00%s\x00%s\x00", kind, workspace, dataset, ts, observed, traceID, spanID)
-	h.Write([]byte(payloadWithoutID))
+	// Writes to a hash.Hash never return an error.
+	_, _ = fmt.Fprintf(h, "%s\x00%s\x00%s\x00%d\x00%d\x00%s\x00%s\x00", kind, workspace, dataset, ts, observed, traceID, spanID)
+	_, _ = h.Write([]byte(payloadWithoutID))
 	return "lh1-" + hex.EncodeToString(h.Sum(nil))[:32]
 }
 

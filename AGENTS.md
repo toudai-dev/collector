@@ -36,5 +36,6 @@ Use standard conventional commit formatting such as `fix(exporter): handle empty
 ## Development Commands
 
 - `make build` builds `bin/toudai-collector`
-- `make vet` runs `go vet ./...`
 - `make test` runs `go test ./...`
+- `make fmt` fails if `gofmt -l .` lists any file
+- `make lint` runs `golangci-lint run ./...` with `.golangci.yml`
