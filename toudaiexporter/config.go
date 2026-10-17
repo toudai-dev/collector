@@ -58,7 +58,6 @@ type Config struct {
 
 var (
 	errMissingTrustedScope = errors.New("trusted scope is missing: the gateway must inject the toudai workspace/dataset attributes before the exporter")
-	errNoRecords           = errors.New("no records to export")
 )
 
 func defaultConfig() *Config {
