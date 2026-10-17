@@ -1,0 +1,75 @@
+# Product gateway: OTLP in, key-derived trusted scope, gateway-assigned event
+# IDs, owned toudai exporter out.
+#
+# Producers send an ingestion key in the X-Toudai-Key header (and, for a key
+# scoped to several datasets, the dataset in X-Toudai-Dataset):
+#
+#   curl -H 'X-Toudai-Key: <key>' -H 'Content-Type: application/json' \
+#        --data @logs.json http://localhost:4318/v1/logs
+#
+# Responses: 401 for a missing, unknown, or read-only key (authentication fails
+# before any pipeline runs); 403 for a dataset the key does not permit; 400 for a
+# missing dataset on a multi-dataset key or a request that sets reserved toudai.*
+# resource attributes. None are retryable.
+#
+# Workspace and dataset come only from the key (toudaiauth + toudaigateway).
+# There is deliberately no static resource processor and no routing connector:
+# a pipeline's scope must not be configured per workspace.
+
+extensions:
+  toudaiauth:
+    keys_file: ${env:TOUDAI_KEYS_FILE:-config/keys.example.yaml}
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: ${env:TOUDAI_OTLP_HTTP_ENDPOINT:-0.0.0.0:4318}
+        auth:
+          authenticator: toudaiauth
+      grpc:
+        endpoint: ${env:TOUDAI_OTLP_GRPC_ENDPOINT:-0.0.0.0:4317}
+        auth:
+          authenticator: toudaiauth
+
+processors:
+  # Injects toudai.workspace_id / toudai.dataset / toudai.scope_source from the
+  # authenticated key and assigns every record its event_id. It must stay ahead
+  # of anything that batches: scope is per request and a batch can mix requests.
+  # Batching in this distribution is the exporter's sending_queue batch below,
+  # which runs after the processor; if a batch processor is ever added, list it
+  # after toudaigateway.
+  toudaigateway: {}
+
+exporters:
+  toudai:
+    endpoint: ${env:TOUDAI_CLICKHOUSE_ENDPOINT:-127.0.0.1:9000}
+    database: ${env:TOUDAI_CLICKHOUSE_DATABASE:-toudai}
+    username: ${env:TOUDAI_CLICKHOUSE_USERNAME:-default}
+    password: ${env:TOUDAI_CLICKHOUSE_PASSWORD:-}
+    timeout: 10s
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 5m
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 1000
+      batch:
+        sizer: items
+        min_size: 1000
+        flush_timeout: 1s
+
+service:
+  extensions: [toudaiauth]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [toudaigateway]
+      exporters: [toudai]
+    traces:
+      receivers: [otlp]
+      processors: [toudaigateway]
+      exporters: [toudai]

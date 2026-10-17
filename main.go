@@ -26,7 +26,9 @@ import (
 	"go.opentelemetry.io/collector/receiver/otlpreceiver"
 	"go.opentelemetry.io/collector/service/telemetry/otelconftelemetry"
 
+	"github.com/toudai-dev/collector/toudaiauthextension"
 	"github.com/toudai-dev/collector/toudaiexporter"
+	"github.com/toudai-dev/collector/toudaigatewayprocessor"
 )
 
 // buildVersion is recorded here because the distribution is built from the
@@ -43,6 +45,9 @@ func components() (otelcol.Factories, error) {
 	}
 	if factories.Processors, err = otelcol.MakeFactoryMap(
 		resourceprocessor.NewFactory(),
+		// The product gateway processor injects key-derived scope and event IDs;
+		// the stock resource processor remains for probes with static scope.
+		toudaigatewayprocessor.NewFactory(),
 		// The stock transform processor is included so the stock write-path probe
 		// can test stock capability in the same binary instead of asserting it.
 		transformprocessor.NewFactory(),
@@ -67,6 +72,7 @@ func components() (otelcol.Factories, error) {
 	if factories.Extensions, err = otelcol.MakeFactoryMap(
 		bearertokenauthextension.NewFactory(),
 		filestorage.NewFactory(),
+		toudaiauthextension.NewFactory(),
 	); err != nil {
 		return otelcol.Factories{}, err
 	}
@@ -79,8 +85,10 @@ func components() (otelcol.Factories, error) {
 	return factories, nil
 }
 
-func main() {
-	set := otelcol.CollectorSettings{
+// collectorSettings is separate from main so tests can run the same
+// distribution in-process against a real config.
+func collectorSettings() otelcol.CollectorSettings {
+	return otelcol.CollectorSettings{
 		BuildInfo: component.BuildInfo{
 			Command:     "toudai-collector",
 			Description: "Bounded Collector distribution with the owned toudai exporter",
@@ -97,7 +105,10 @@ func main() {
 			},
 		},
 	}
-	if err := run(set); err != nil {
+}
+
+func main() {
+	if err := run(collectorSettings()); err != nil {
 		os.Exit(1)
 	}
 }
