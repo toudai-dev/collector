@@ -33,6 +33,7 @@
             go
             gopls
             golangci-lint
+            git-cliff
             gnumake
 
             # Local ClickHouse for exercising the exporter against the Toudai DDL.
