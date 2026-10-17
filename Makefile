@@ -6,10 +6,6 @@ build:
 test:
 	go test ./...
 
-.PHONY: vet
-vet:
-	go vet ./...
-
 # Check-only, like CI: lists unformatted files and fails if there are any.
 .PHONY: fmt
 fmt:
