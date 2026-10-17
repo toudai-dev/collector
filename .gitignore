@@ -1,0 +1,18 @@
+# Binaries and build output
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test, coverage, and profiling output
+*.test
+*.out
+
+.DS_Store
+.idea
+*.log
+tmp/
+.claude/
+.cache/
