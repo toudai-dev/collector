@@ -1,0 +1,12 @@
+version: "2"
+
+# The standard linter set (errcheck, govet, ineffassign, staticcheck, unused)
+# plus gofmt/goimports as formatters. CI runs these through `make lint` and
+# `make fmt`.
+linters:
+  default: standard
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

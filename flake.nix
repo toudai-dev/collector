@@ -32,6 +32,7 @@
           nativeBuildInputs = with pkgs; [
             go
             gopls
+            golangci-lint
             gnumake
 
             # Local ClickHouse for exercising the exporter against the Toudai DDL.
