@@ -32,3 +32,9 @@ Use standard conventional commit formatting such as `fix(exporter): handle empty
 - Prefer writing table tests over individual tests whenever possible
 - Add comments that describe intent for non-obvious logic. This is required when code encodes a production constraint, workaround, performance tradeoff, safety guardrail, or surprising behavior.
 - Keep comments succinct and useful for review. Avoid comments that merely restate what the next line of code does.
+
+## Development Commands
+
+- `make build` builds `bin/toudai-collector`
+- `make vet` runs `go vet ./...`
+- `make test` runs `go test ./...`
