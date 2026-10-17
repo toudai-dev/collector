@@ -2,6 +2,10 @@
 build:
 	go build -o bin/toudai-collector .
 
+.PHONY: vet
+vet:
+	go vet ./...
+
 .PHONY: test
 test:
 	go test ./...
