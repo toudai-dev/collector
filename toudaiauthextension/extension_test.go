@@ -63,6 +63,7 @@ func TestAuthenticate(t *testing.T) {
 		{"authorization header is not the key", map[string][]string{"Authorization": {"Bearer " + keyA}}, errMissingKey, nil, ""},
 		{"read-only key", map[string][]string{"X-Toudai-Key": {keyRO}}, errNoWrite, nil, ""},
 		{"two key headers", map[string][]string{"X-Toudai-Key": {keyA, keyB}}, errMultipleKeys, nil, ""},
+		{"empty dataset header counts as absent", map[string][]string{"X-Toudai-Key": {keyB}, "X-Toudai-Dataset": {" "}}, nil, []string{"prod"}, ""},
 		{"two dataset headers", map[string][]string{"X-Toudai-Key": {keyA}, "X-Toudai-Dataset": {"prod", "staging"}}, errMultipleScopes, nil, ""},
 	}
 	ext := newTestExtension(t)
@@ -222,7 +223,12 @@ keys:
 		{"short key", strings.Replace(ok, "tk_test_valid_key_0123456789", "short", 1), "shorter than"},
 		// The retired workspace field fails loudly instead of being ignored.
 		{"workspace_id is no longer a key field", strings.Replace(ok, "write:", "workspace_id: ws-1\n    write:", 1), "invalid content at line"},
-		{"no datasets", strings.Replace(ok, "datasets: [a]", "datasets: []", 1), "at least one dataset"},
+		// A key without a dataset list may write to any dataset (Decision 0002 D3).
+		{"explicit empty dataset list", strings.Replace(ok, "datasets: [a]", "datasets: []", 1), "omit it to permit every dataset"},
+		{"no dataset list", strings.Replace(ok, "datasets: [a]\n", "", 1), ""},
+		{"dataset list with every item commented out", strings.Replace(ok, "datasets: [a]", "datasets:\n      # - a", 1), "omit it to permit every dataset"},
+		{"null dataset list", strings.Replace(ok, "datasets: [a]", "datasets: ~", 1), "omit it to permit every dataset"},
+		{"dataset list is not a list", strings.Replace(ok, "datasets: [a]", "datasets: {a: b}", 1), "must be a list"},
 		{"bad dataset", strings.Replace(ok, "[a]", "['a b']", 1), "not a valid identifier"},
 		{"duplicate dataset", strings.Replace(ok, "[a]", "[a, a]", 1), "listed twice"},
 		{"misspelled field", strings.Replace(ok, "write:", "writes:", 1), "invalid content at line"},

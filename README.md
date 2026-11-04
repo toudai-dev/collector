@@ -52,14 +52,22 @@ one deployment serves one customer, and accounts, workspaces, and the mapping of
 belong to a private control plane (Decision 0002).
 
 - **`toudaiauth` extension** validates an ingestion key from the `X-Toudai-Key` header against a
-  static key file (`config/keys.example.yaml`) that maps each key to its write permission and
-  allowed datasets. A missing, unknown, or read-only key is a 401 before any pipeline runs. The
-  key is held as a digest, removed from receiver metadata, and never appears in auth data,
-  errors, or exported data. Rotation and revocation are file edits plus a restart.
-- **`toudaigateway` processor** sets `toudai.dataset`. The dataset is the `X-Toudai-Dataset`
-  header, or the key's only dataset; a dataset outside the key's list is a 403. A resource that
-  carries any `toudai.*` attribute is a 400. It assigns every log record and span a random UUIDv7
-  `event_id`, so a producer retry or an identical event always gets a new one.
+  static key file (`config/keys.example.yaml`) that maps each key to its write permission and an
+  optional list of allowed datasets; a key without a list may write to any dataset. A missing,
+  unknown, or read-only key is a 401 before any pipeline runs. The key is held as a digest,
+  removed from receiver metadata, and never appears in auth data, errors, or exported data.
+  Rotation and revocation are file edits plus a restart.
+- **`toudaigateway` processor** resolves and sets `toudai.dataset`: the `X-Toudai-Dataset`
+  header, else the key's only dataset, else the configured `default_dataset` (none by default).
+  A dataset outside the key's list is a 403, whichever source it came from; an unresolved or
+  invalid dataset name is a 400. A producer `toudai.dataset` on the resource is accepted only when
+  it equals the resolved dataset (403 when outside the key's list, else 400); any other
+  `toudai.*` resource attribute is a 400. It assigns every log record and span a random UUIDv7
+  `event_id`, replacing any producer `toudai.event_id`, so a producer retry or an identical
+  event always gets a new one.
+
+Dataset resolution is write-side only. The query service takes the dataset explicitly from each
+query and checks it against the read key's optional list.
 
 `main_test.go` runs the example through the real receivers over HTTP and gRPC.
 

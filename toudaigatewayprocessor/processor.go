@@ -27,8 +27,10 @@ import (
 var (
 	errNoIdentity       = reject(codes.Internal, "request has no authenticated ingestion key: the receiver must use the toudaiauth authenticator")
 	errNoWrite          = reject(codes.PermissionDenied, "ingestion key lacks write permission")
-	errDatasetRequired  = reject(codes.InvalidArgument, "dataset is required: the key is scoped to more than one dataset")
+	errDatasetRequired  = reject(codes.InvalidArgument, "dataset is required: the key does not name a single dataset and no default dataset is configured")
+	errInvalidDataset   = reject(codes.InvalidArgument, "dataset is not a valid dataset name")
 	errUnknownDataset   = reject(codes.PermissionDenied, "dataset is not permitted for this ingestion key")
+	errDatasetMismatch  = reject(codes.InvalidArgument, "resource toudai.dataset does not match the request's dataset")
 	errReservedResource = reject(codes.InvalidArgument, "resource attribute in the reserved toudai. namespace is not accepted from producers")
 )
 
@@ -45,18 +47,25 @@ func reject(code codes.Code, msg string) error {
 func (r *rejection) Error() string              { return r.msg }
 func (r *rejection) GRPCStatus() *status.Status { return status.New(r.code, r.msg) }
 
-// scope is the trusted scope for one request.
+// scope is the trusted scope for one request: the resolved dataset and the
+// key's dataset list (empty when the key permits every dataset).
 type scope struct {
-	dataset string
+	dataset  string
+	datasets []string
+}
+
+func (sc scope) permits(dataset string) bool {
+	return len(sc.datasets) == 0 || slices.Contains(sc.datasets, dataset)
 }
 
 type gateway struct {
+	defaultDataset string
 	// newEventID is replaceable so tests can inject a failing or fixed source.
 	newEventID func() (string, error)
 }
 
-func newGateway() *gateway {
-	return &gateway{newEventID: func() (string, error) {
+func newGateway(cfg *Config) *gateway {
+	return &gateway{defaultDataset: cfg.DefaultDataset, newEventID: func() (string, error) {
 		// UUIDv7 is time-ordered, so IDs sort by gateway receipt time, and it is
 		// random rather than content-derived: two identical events, or a producer
 		// retry, always get distinct IDs. google/uuid keeps v7 IDs monotonic
@@ -69,8 +78,10 @@ func newGateway() *gateway {
 	}}
 }
 
-// requestScope resolves the scope the authenticated key grants for this request.
-func requestScope(ctx context.Context) (scope, error) {
+// requestScope resolves the request's dataset (Decision 0002 D3): the dataset
+// header, else the key's only dataset, else the configured default. Whichever
+// source wins, a dataset outside the key's list is refused.
+func (g *gateway) requestScope(ctx context.Context) (scope, error) {
 	auth := client.FromContext(ctx).Auth
 	if auth == nil {
 		return scope{}, errNoIdentity
@@ -86,35 +97,64 @@ func requestScope(ctx context.Context) (scope, error) {
 	if !write {
 		return scope{}, errNoWrite
 	}
-	datasets, _ := auth.GetAttribute(toudaiauthextension.AttrDatasets).([]string)
-	requested, _ := auth.GetAttribute(toudaiauthextension.AttrRequestedDataset).(string)
+	// The extension always publishes a typed list, nil when the key permits
+	// every dataset. Its absence means another authenticator, and reading that
+	// as "every dataset" would fail open.
+	datasets, ok := auth.GetAttribute(toudaiauthextension.AttrDatasets).([]string)
+	if !ok {
+		return scope{}, errNoIdentity
+	}
+	sc := scope{datasets: datasets}
+	sc.dataset, _ = auth.GetAttribute(toudaiauthextension.AttrRequestedDataset).(string)
 	switch {
-	case requested == "" && len(datasets) == 1:
-		requested = datasets[0]
-	case requested == "":
+	case sc.dataset != "":
+	case len(datasets) == 1:
+		sc.dataset = datasets[0]
+	case g.defaultDataset != "":
+		sc.dataset = g.defaultDataset
+	default:
 		return scope{}, errDatasetRequired
-	case !slices.Contains(datasets, requested):
+	}
+	// The header is producer input and a key without a list accepts any name,
+	// so the name itself must be checked before it becomes a stored value.
+	if !reserved.ValidDataset(sc.dataset) {
+		return scope{}, errInvalidDataset
+	}
+	if !sc.permits(sc.dataset) {
 		return scope{}, errUnknownDataset
 	}
-	return scope{dataset: requested}, nil
+	return sc, nil
 }
 
-// checkResource rejects a resource that tries to set gateway-owned scope.
-// Overwriting would also be safe; rejecting makes a forgery attempt visible to
-// the producer and to operators instead of silently succeeding.
-func checkResource(attrs pcommon.Map) error {
-	var found bool
-	attrs.Range(func(k string, _ pcommon.Value) bool {
-		found = reserved.Is(k)
-		return !found
+// checkResource rejects a resource that tries to set gateway-owned values. A
+// producer toudai.dataset is accepted only when it equals the resolved dataset
+// (Decision 0002 D3); one outside the key's list is refused like a header
+// would be. Every other toudai.* key is rejected. Overwriting would also be
+// safe; rejecting makes a conflicting or forged value visible to the producer
+// and to operators instead of silently succeeding.
+func checkResource(attrs pcommon.Map, sc scope) error {
+	var err error
+	attrs.Range(func(k string, v pcommon.Value) bool {
+		switch {
+		case !reserved.Is(k):
+		case k != reserved.DatasetAttr:
+			err = errReservedResource
+		case v.Type() != pcommon.ValueTypeStr:
+			err = errDatasetMismatch
+		case !sc.permits(v.Str()):
+			err = errUnknownDataset
+		case v.Str() != sc.dataset:
+			err = errDatasetMismatch
+		}
+		return err == nil
 	})
-	if found {
-		return errReservedResource
-	}
-	return nil
+	return err
 }
 
 func (g *gateway) stampResource(attrs pcommon.Map, sc scope) {
+	// RemoveIf for the same reason as in stampEvent: a matching producer value
+	// may appear more than once on the wire.
+	attrs.RemoveIf(func(k string, _ pcommon.Value) bool { return k == reserved.DatasetAttr })
 	attrs.PutStr(reserved.DatasetAttr, sc.dataset)
 }
 
@@ -133,7 +173,7 @@ func (g *gateway) stampEvent(attrs pcommon.Map) error {
 }
 
 func (g *gateway) processLogs(ctx context.Context, ld plog.Logs) (plog.Logs, error) {
-	sc, err := requestScope(ctx)
+	sc, err := g.requestScope(ctx)
 	if err != nil {
 		return ld, err
 	}
@@ -141,7 +181,7 @@ func (g *gateway) processLogs(ctx context.Context, ld plog.Logs) (plog.Logs, err
 	// never half-stamped.
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
-		if err := checkResource(rls.At(i).Resource().Attributes()); err != nil {
+		if err := checkResource(rls.At(i).Resource().Attributes(), sc); err != nil {
 			return ld, err
 		}
 	}
@@ -161,13 +201,13 @@ func (g *gateway) processLogs(ctx context.Context, ld plog.Logs) (plog.Logs, err
 }
 
 func (g *gateway) processTraces(ctx context.Context, td ptrace.Traces) (ptrace.Traces, error) {
-	sc, err := requestScope(ctx)
+	sc, err := g.requestScope(ctx)
 	if err != nil {
 		return td, err
 	}
 	rss := td.ResourceSpans()
 	for i := 0; i < rss.Len(); i++ {
-		if err := checkResource(rss.At(i).Resource().Attributes()); err != nil {
+		if err := checkResource(rss.At(i).Resource().Attributes(), sc); err != nil {
 			return td, err
 		}
 	}

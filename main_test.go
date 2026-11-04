@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -34,6 +35,7 @@ const (
 	keyMulti    = "tk_example_multi_0123456789abcdef"
 	keyStaging  = "tk_example_staging_0123456789abcdef"
 	keyReadonly = "tk_example_readonly_0123456789abcd"
+	keyAny      = "tk_example_any_0123456789abcdef"
 )
 
 func freeAddr(t *testing.T) string {
@@ -90,6 +92,9 @@ service:
 	t.Setenv("TOUDAI_OTLP_HTTP_ENDPOINT", httpAddr)
 	t.Setenv("TOUDAI_OTLP_GRPC_ENDPOINT", grpcAddr)
 	t.Setenv("TOUDAI_KEYS_FILE", exampleKeys)
+	if _, ok := os.LookupEnv("TOUDAI_DEFAULT_DATASET"); !ok {
+		t.Setenv("TOUDAI_DEFAULT_DATASET", "")
+	}
 
 	set := collectorSettings()
 	set.DisableGracefulShutdown = true
@@ -230,8 +235,13 @@ func TestGatewayIngestion(t *testing.T) {
 		{"unknown dataset", map[string]string{"X-Toudai-Key": keyMulti, "X-Toudai-Dataset": "nope"}, "", "", 403, ""},
 		{"dataset belonging only to another key", map[string]string{"X-Toudai-Key": keyProd, "X-Toudai-Dataset": "staging"}, "", "", 403, ""},
 		{"multi-dataset key without a dataset", map[string]string{"X-Toudai-Key": keyMulti}, "", "", 400, ""},
+		{"key without a dataset list names any dataset", map[string]string{"X-Toudai-Key": keyAny, "X-Toudai-Dataset": "canary"}, "", "", 200, "canary"},
+		{"key without a dataset list and no default", map[string]string{"X-Toudai-Key": keyAny}, "", "", 400, ""},
+		{"invalid dataset name", map[string]string{"X-Toudai-Key": keyAny, "X-Toudai-Dataset": "a b"}, "", "", 400, ""},
+		{"resource dataset equal to the resolved one", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.dataset","value":{"stringValue":"prod"}}`, "", 200, "prod"},
+		{"resource dataset outside the key's list", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 403, ""},
+		{"resource dataset permitted but not the requested one", map[string]string{"X-Toudai-Key": keyMulti, "X-Toudai-Dataset": "prod"}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 400, ""},
 		{"retired workspace attribute on resource", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.workspace_id","value":{"stringValue":"ws"}}`, "", 400, ""},
-		{"override attempt: dataset on resource", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 400, ""},
 		{"retired scope marker on resource", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.scope_source","value":{"stringValue":"gateway"}}`, "", 400, ""},
 		{"missing key", nil, "", "", 401, ""},
 		{"unknown key", map[string]string{"X-Toudai-Key": "tk_example_not_a_real_key_000"}, "", "", 401, ""},
@@ -318,6 +328,36 @@ func TestGatewayTraces(t *testing.T) {
 	got, _ := readExported(t, outFile, 1)
 	if len(got) != 1 || got[0].resource["toudai.dataset"] != "staging" || got[0].record["toudai.event_id"] == "" {
 		t.Fatalf("exported = %+v, want one span in dataset staging with an event_id", got)
+	}
+}
+
+// With default_dataset set, a request the header and key leave unresolved lands
+// in the default, and the default is still held to the key's list.
+func TestGatewayDefaultDataset(t *testing.T) {
+	t.Setenv("TOUDAI_DEFAULT_DATASET", "staging")
+	base, _, outFile := gateway(t)
+	body := fmt.Sprintf(logBody, "", "")
+	tests := []struct {
+		name       string
+		key        string
+		wantStatus int
+	}{
+		{"key without a dataset list", keyAny, 200},
+		{"multi-dataset key that permits the default", keyMulti, 200},
+		{"single-dataset key keeps its own dataset", keyProd, 200},
+	}
+	for _, tc := range tests {
+		if status, resp := post(t, base+"/v1/logs", body, map[string]string{"X-Toudai-Key": tc.key}); status != tc.wantStatus {
+			t.Fatalf("%s: status = %d (%s), want %d", tc.name, status, resp, tc.wantStatus)
+		}
+	}
+	got, _ := readExported(t, outFile, 3)
+	var datasets []string
+	for _, r := range got {
+		datasets = append(datasets, r.resource["toudai.dataset"])
+	}
+	if !slices.Equal(datasets, []string{"staging", "staging", "prod"}) {
+		t.Fatalf("datasets = %v, want [staging staging prod]", datasets)
 	}
 }
 

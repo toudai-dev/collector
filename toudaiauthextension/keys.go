@@ -10,23 +10,25 @@ import (
 	"sort"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/toudai-dev/collector/internal/reserved"
 )
 
 // minKeyLength rejects keys short enough to be guessed; generated keys are far
 // longer.
 const minKeyLength = 16
 
-// nameRE bounds dataset identifiers to a conservative charset so
-// they are safe in logs, attributes, and ClickHouse string columns.
-var nameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
-
 type keyFile struct {
 	Keys map[string]keyEntry `yaml:"keys"`
 }
 
 type keyEntry struct {
-	Datasets []string `yaml:"datasets"`
-	Write    bool     `yaml:"write"`
+	// Datasets optionally restricts the key; an omitted field permits every
+	// dataset (Decision 0002 D3), as read keys do in the query service. It is
+	// a node so a present but empty or null list (for example one whose items
+	// are all commented out) can be told apart from an omitted one.
+	Datasets yaml.Node `yaml:"datasets"`
+	Write    bool      `yaml:"write"`
 }
 
 // scope is what a key permits.
@@ -79,12 +81,20 @@ func parseKeyStore(raw []byte) (keyStore, error) {
 		if len(k) < minKeyLength {
 			return nil, fmt.Errorf("keys_file entry %d: key is shorter than %d characters", i+1, minKeyLength)
 		}
-		if len(e.Datasets) == 0 {
-			return nil, fmt.Errorf("keys_file entry %d: datasets must list at least one dataset", i+1)
+		// An omitted list permits every dataset; a present but empty one is
+		// refused, because it reads as "no datasets" and would grant all.
+		var datasets []string
+		if e.Datasets.Kind != 0 {
+			if err := e.Datasets.Decode(&datasets); err != nil {
+				return nil, fmt.Errorf("keys_file entry %d: datasets must be a list of dataset names", i+1)
+			}
+			if len(datasets) == 0 {
+				return nil, fmt.Errorf("keys_file entry %d: datasets is empty; omit it to permit every dataset", i+1)
+			}
 		}
-		seen := make(map[string]bool, len(e.Datasets))
-		for _, d := range e.Datasets {
-			if !nameRE.MatchString(d) {
+		seen := make(map[string]bool, len(datasets))
+		for _, d := range datasets {
+			if !reserved.ValidDataset(d) {
 				return nil, fmt.Errorf("keys_file entry %d: dataset %q is not a valid identifier", i+1, d)
 			}
 			if seen[d] {
@@ -93,7 +103,7 @@ func parseKeyStore(raw []byte) (keyStore, error) {
 			seen[d] = true
 		}
 		store[sha256.Sum256([]byte(k))] = scope{
-			datasets: append([]string(nil), e.Datasets...),
+			datasets: datasets,
 			write:    e.Write,
 		}
 	}

@@ -22,11 +22,11 @@ func NewFactory() processor.Factory {
 }
 
 func createLogs(ctx context.Context, set processor.Settings, cfg component.Config, next consumer.Logs) (processor.Logs, error) {
-	return processorhelper.NewLogs(ctx, set, cfg, next, newGateway().processLogs,
+	return processorhelper.NewLogs(ctx, set, cfg, next, newGateway(cfg.(*Config)).processLogs,
 		processorhelper.WithCapabilities(consumer.Capabilities{MutatesData: true}))
 }
 
 func createTraces(ctx context.Context, set processor.Settings, cfg component.Config, next consumer.Traces) (processor.Traces, error) {
-	return processorhelper.NewTraces(ctx, set, cfg, next, newGateway().processTraces,
+	return processorhelper.NewTraces(ctx, set, cfg, next, newGateway(cfg.(*Config)).processTraces,
 		processorhelper.WithCapabilities(consumer.Capabilities{MutatesData: true}))
 }

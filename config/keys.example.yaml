@@ -1,6 +1,7 @@
 # Static ingestion keys for the product gateway (toudaiauth extension).
 #
-# Each key maps to the datasets it may write and whether it may write at all.
+# Each key maps to whether it may write at all and, optionally, the datasets it
+# may write; a key without a dataset list may write to any dataset.
 # A key maps to permissions, never to a customer: one deployment serves one
 # customer (Decision 0002), and accounts or workspaces belong to the private
 # control plane. There may be several keys (for example one per environment, or
@@ -15,12 +16,17 @@ keys:
     datasets: [prod]
     write: true
   tk_example_multi_0123456789abcdef:
-    # A key scoped to several datasets must name one per request with the
-    # X-Toudai-Dataset header; a name outside this list fails the request.
+    # A key scoped to several datasets names one per request with the
+    # X-Toudai-Dataset header, else gets the gateway's default_dataset; a name
+    # outside this list fails the request.
     datasets: [prod, staging]
     write: true
   tk_example_staging_0123456789abcdef:
     datasets: [staging]
+    write: true
+  tk_example_any_0123456789abcdef:
+    # No dataset list: the request names its dataset with X-Toudai-Dataset, or
+    # the gateway's default_dataset applies.
     write: true
   tk_example_readonly_0123456789abcd:
     datasets: [prod]

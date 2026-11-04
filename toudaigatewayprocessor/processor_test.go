@@ -58,36 +58,67 @@ func oneLog(mutateResource func(plog.ResourceLogs), mutateRecord func(plog.LogRe
 	return ld
 }
 
+// Decision 0002 D3: the dataset is the header, else the key's only dataset,
+// else the configured default, and from any source it must be in the key's
+// list. A producer resource toudai.dataset must agree with the result.
 func TestProcessLogsScope(t *testing.T) {
+	all := []string(nil) // a key with no dataset list permits every dataset
+	dsOnResource := func(v string) func(plog.ResourceLogs) {
+		return func(rl plog.ResourceLogs) { rl.Resource().Attributes().PutStr(reserved.DatasetAttr, v) }
+	}
 	tests := []struct {
 		name        string
+		def         string // configured default_dataset
 		ctx         context.Context
+		resource    func(plog.ResourceLogs)
 		wantErr     error
 		wantDataset string
 	}{
-		{"single dataset key defaults to its dataset", authCtx([]string{"prod"}, "", true), nil, "prod"},
-		{"requested dataset inside scope", authCtx([]string{"prod", "staging"}, "staging", true), nil, "staging"},
-		{"requested dataset equal to the only dataset", authCtx([]string{"prod"}, "prod", true), nil, "prod"},
-		{"multi-dataset key must choose", authCtx([]string{"prod", "staging"}, "", true), errDatasetRequired, ""},
-		{"unknown dataset", authCtx([]string{"prod"}, "nope", true), errUnknownDataset, ""},
-		{"dataset match is exact", authCtx([]string{"prod"}, "Prod", true), errUnknownDataset, ""},
-		{"no write permission", authCtx([]string{"prod"}, "", false), errNoWrite, ""},
-		{"no authenticated identity", context.Background(), errNoIdentity, ""},
-		{"auth data from another authenticator", client.NewContext(context.Background(), client.Info{Auth: testAuth{"subject": "x"}}), errNoIdentity, ""},
+		{"single dataset key defaults to its dataset", "", authCtx([]string{"prod"}, "", true), nil, nil, "prod"},
+		{"key's only dataset wins over the default", "staging", authCtx([]string{"prod"}, "", true), nil, nil, "prod"},
+		{"header wins over the key's only dataset", "", authCtx([]string{"prod"}, "prod", true), nil, nil, "prod"},
+		{"header inside the key's list", "", authCtx([]string{"prod", "staging"}, "staging", true), nil, nil, "staging"},
+		{"header wins over the default", "prod", authCtx([]string{"prod", "staging"}, "staging", true), nil, nil, "staging"},
+		{"multi-dataset key falls back to the default", "staging", authCtx([]string{"prod", "staging"}, "", true), nil, nil, "staging"},
+		{"unrestricted key falls back to the default", "prod", authCtx(all, "", true), nil, nil, "prod"},
+		{"unrestricted key accepts any valid header", "", authCtx(all, "anything-1", true), nil, nil, "anything-1"},
+		{"multi-dataset key without header or default", "", authCtx([]string{"prod", "staging"}, "", true), nil, errDatasetRequired, ""},
+		{"unrestricted key without header or default", "", authCtx(all, "", true), nil, errDatasetRequired, ""},
+		{"default outside the key's list", "other", authCtx([]string{"prod", "staging"}, "", true), nil, errUnknownDataset, ""},
+		{"header outside the key's list", "", authCtx([]string{"prod"}, "nope", true), nil, errUnknownDataset, ""},
+		{"dataset match is exact", "", authCtx([]string{"prod"}, "Prod", true), nil, errUnknownDataset, ""},
+		{"invalid header name, unrestricted key", "", authCtx(all, "a b", true), nil, errInvalidDataset, ""},
+		{"resource dataset equal to the resolved one", "", authCtx([]string{"prod"}, "", true), dsOnResource("prod"), nil, "prod"},
+		{"resource dataset equal to the header", "", authCtx(all, "x1", true), dsOnResource("x1"), nil, "x1"},
+		{"resource dataset outside the key's list", "", authCtx([]string{"prod"}, "", true), dsOnResource("staging"), errUnknownDataset, ""},
+		{"resource dataset permitted but not resolved", "", authCtx([]string{"prod", "staging"}, "prod", true), dsOnResource("staging"), errDatasetMismatch, ""},
+		{"resource dataset differs, unrestricted key", "prod", authCtx(all, "", true), dsOnResource("staging"), errDatasetMismatch, ""},
+		{"resource dataset is not a string", "", authCtx([]string{"prod"}, "", true), func(rl plog.ResourceLogs) {
+			rl.Resource().Attributes().PutInt(reserved.DatasetAttr, 1)
+		}, errDatasetMismatch, ""},
+		{"no write permission", "", authCtx([]string{"prod"}, "", false), nil, errNoWrite, ""},
+		{"no authenticated identity", "", context.Background(), nil, errNoIdentity, ""},
+		{"auth data from another authenticator", "", client.NewContext(context.Background(), client.Info{Auth: testAuth{"subject": "x"}}), nil, errNoIdentity, ""},
+		{"write attribute without a dataset list", "", client.NewContext(context.Background(), client.Info{Auth: testAuth{
+			toudaiauthextension.AttrWrite: true, toudaiauthextension.AttrRequestedDataset: "prod",
+		}}), nil, errNoIdentity, ""},
 	}
-	g := newGateway()
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ld := oneLog(nil, nil)
-			out, err := g.processLogs(tc.ctx, ld)
+			ld := oneLog(tc.resource, nil)
+			before := ld.ResourceLogs().At(0).Resource().Attributes().AsRaw()
+			out, err := newGateway(&Config{DefaultDataset: tc.def}).processLogs(tc.ctx, ld)
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) || !consumererror.IsPermanent(err) {
 					t.Fatalf("error = %v, want permanent %v", err, tc.wantErr)
 				}
-				// A rejected request must carry no trusted attributes forward.
-				res := out.ResourceLogs().At(0).Resource().Attributes()
-				if _, ok := res.Get(reserved.DatasetAttr); ok {
-					t.Fatal("rejected request was stamped with a dataset")
+				// A rejected request is not stamped: no event ID, and the
+				// resource is exactly what the producer sent.
+				if _, ok := out.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Attributes().Get(reserved.EventIDAttr); ok {
+					t.Fatal("rejected request was assigned an event ID")
+				}
+				if got := out.ResourceLogs().At(0).Resource().Attributes().AsRaw(); !reflect.DeepEqual(got, before) {
+					t.Fatalf("rejected request's resource = %v, want it unchanged %v", got, before)
 				}
 				return
 			}
@@ -108,13 +139,13 @@ func TestProcessLogsRejectsReservedResourceAttributes(t *testing.T) {
 	for _, key := range []string{
 		// The retired workspace and scope-marker attributes are now ordinary
 		// reserved-namespace keys and get the same rejection as any other.
-		"toudai.workspace_id", "toudai.scope_source", reserved.DatasetAttr, reserved.EventIDAttr, "toudai.anything_else",
+		"toudai.workspace_id", "toudai.scope_source", reserved.EventIDAttr, "toudai.anything_else",
 	} {
 		t.Run(key, func(t *testing.T) {
 			ld := oneLog(func(rl plog.ResourceLogs) {
 				rl.Resource().Attributes().PutStr(key, "99999999-9999-4999-8999-999999999999")
 			}, nil)
-			_, err := newGateway().processLogs(authCtx([]string{"prod"}, "", true), ld)
+			_, err := newGateway(&Config{}).processLogs(authCtx([]string{"prod"}, "", true), ld)
 			if !errors.Is(err, errReservedResource) || !consumererror.IsPermanent(err) {
 				t.Fatalf("error = %v, want permanent %v", err, errReservedResource)
 			}
@@ -132,7 +163,7 @@ func TestProcessLogsForgedResourceRejectsWholeRequest(t *testing.T) {
 	rl := ld.ResourceLogs().AppendEmpty()
 	rl.Resource().Attributes().PutStr("toudai.anything_else", "x")
 	rl.ScopeLogs().AppendEmpty().LogRecords().AppendEmpty()
-	out, err := newGateway().processLogs(authCtx([]string{"prod"}, "", true), ld)
+	out, err := newGateway(&Config{}).processLogs(authCtx([]string{"prod"}, "", true), ld)
 	if !errors.Is(err, errReservedResource) {
 		t.Fatalf("error = %v, want %v", err, errReservedResource)
 	}
@@ -158,7 +189,7 @@ func TestProcessLogsAssignsUniqueUUIDv7PerRecord(t *testing.T) {
 			}
 		}
 	}
-	out, err := newGateway().processLogs(authCtx([]string{"prod"}, "", true), ld)
+	out, err := newGateway(&Config{}).processLogs(authCtx([]string{"prod"}, "", true), ld)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +244,7 @@ func TestProcessLogsReplacesProducerEventID(t *testing.T) {
 	if attrs.Len() != 4 {
 		t.Fatalf("fixture has %d attributes, want the duplicate preserved (4)", attrs.Len())
 	}
-	out, err := newGateway().processLogs(authCtx([]string{"prod"}, "", true), ld)
+	out, err := newGateway(&Config{}).processLogs(authCtx([]string{"prod"}, "", true), ld)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,8 +264,70 @@ func TestProcessLogsReplacesProducerEventID(t *testing.T) {
 	}
 }
 
+// Every resource and every copy of a duplicated OTLP key is checked: a matching
+// value may appear twice and collapses to one, while any conflicting copy or
+// resource rejects the whole request before anything is stamped. Built from
+// JSON because pcommon's API cannot express duplicate keys.
+func TestProcessLogsChecksEveryResourceDataset(t *testing.T) {
+	resource := func(values ...string) string {
+		var attrs []string
+		for _, v := range values {
+			attrs = append(attrs, `{"key":"toudai.dataset","value":{"stringValue":"`+v+`"}}`)
+		}
+		return `{"resource":{"attributes":[` + strings.Join(attrs, ",") + `]},"scopeLogs":[{"logRecords":[{"body":{"stringValue":"b"}}]}]}`
+	}
+	tests := []struct {
+		name      string
+		resources []string
+		wantErr   error
+	}{
+		{"duplicate matching copies", []string{resource("prod", "prod")}, nil},
+		{"duplicate conflicting copies", []string{resource("prod", "staging")}, errDatasetMismatch},
+		{"second resource mismatched", []string{resource(), resource("staging")}, errDatasetMismatch},
+		{"second resource outside the key's list", []string{resource(), resource("other")}, errUnknownDataset},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ld, err := (&plog.JSONUnmarshaler{}).UnmarshalLogs([]byte(`{"resourceLogs":[` + strings.Join(tc.resources, ",") + `]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := newGateway(&Config{}).processLogs(authCtx([]string{"prod", "staging"}, "prod", true), ld)
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("error = %v, want %v", err, tc.wantErr)
+			}
+			for i := 0; i < out.ResourceLogs().Len(); i++ {
+				var got []string
+				out.ResourceLogs().At(i).Resource().Attributes().Range(func(k string, v pcommon.Value) bool {
+					if k == reserved.DatasetAttr {
+						got = append(got, v.Str())
+					}
+					return true
+				})
+				switch {
+				case tc.wantErr == nil && (len(got) != 1 || got[0] != "prod"):
+					t.Fatalf("resource %d datasets = %v, want exactly [prod]", i, got)
+				case tc.wantErr != nil && i == 0 && len(tc.resources) > 1 && len(got) != 0:
+					t.Fatal("a rejected request left its first resource stamped")
+				}
+			}
+		})
+	}
+}
+
+func TestConfigValidate(t *testing.T) {
+	for _, tc := range []struct {
+		def     string
+		wantErr bool
+	}{{"", false}, {"prod", false}, {"a b", true}, {"-lead", true}} {
+		if err := (&Config{DefaultDataset: tc.def}).Validate(); (err != nil) != tc.wantErr {
+			t.Errorf("Validate(%q) = %v, wantErr %v", tc.def, err, tc.wantErr)
+		}
+	}
+}
+
 func TestProcessLogsFailsWhenIDGenerationFails(t *testing.T) {
-	g := newGateway()
+	g := newGateway(&Config{})
 	boom := errors.New("entropy exhausted")
 	g.newEventID = func() (string, error) { return "", boom }
 	_, err := g.processLogs(authCtx([]string{"prod"}, "", true), oneLog(nil, nil))
@@ -269,7 +362,7 @@ func TestProcessTraces(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := newGateway().processTraces(tc.ctx, build(tc.forge))
+			out, err := newGateway(&Config{}).processTraces(tc.ctx, build(tc.forge))
 			if tc.wantErr != nil {
 				if !errors.Is(err, tc.wantErr) || !consumererror.IsPermanent(err) {
 					t.Fatalf("error = %v, want permanent %v", err, tc.wantErr)
@@ -302,6 +395,8 @@ func TestRejectionsCarryClientStatuses(t *testing.T) {
 	}{
 		{errUnknownDataset, codes.PermissionDenied},
 		{errDatasetRequired, codes.InvalidArgument},
+		{errInvalidDataset, codes.InvalidArgument},
+		{errDatasetMismatch, codes.InvalidArgument},
 		{errReservedResource, codes.InvalidArgument},
 		{errNoWrite, codes.PermissionDenied},
 		{errNoIdentity, codes.Internal},

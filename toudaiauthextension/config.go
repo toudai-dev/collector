@@ -22,8 +22,9 @@ type Config struct {
 	KeysFile string `mapstructure:"keys_file"`
 	// KeyHeader is the request header carrying the ingestion key.
 	KeyHeader string `mapstructure:"key_header"`
-	// DatasetHeader optionally names the dataset a request writes to. Without it
-	// a key scoped to exactly one dataset writes there.
+	// DatasetHeader optionally names the dataset a request writes to. Without
+	// it (or with it empty), the gateway processor uses the key's only dataset,
+	// else its default_dataset.
 	DatasetHeader string `mapstructure:"dataset_header"`
 }
 
