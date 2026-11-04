@@ -66,6 +66,13 @@ so apply it with `clickhouse-client --param_database=<name>` (or the source repo
 Dataset resolution is write-side only; reads name their dataset explicitly in the query service.
 `main_test.go` runs the example through the real receivers over HTTP and gRPC.
 
+`e2e_test.go` runs the example gateway with the `toudai` exporter against a
+`clickhouse/clickhouse-server:26.8.2.7` container: it applies the vendored DDL to a custom database
+with `--param_database`, checks dataset precedence, key restrictions, and rejections as stored
+rows, and checks that no tenant column, retired attribute, or key reaches ClickHouse or the
+collector log. It is skipped without a Docker daemon; `TOUDAI_REQUIRE_CLICKHOUSE=1` turns that
+into a failure.
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
