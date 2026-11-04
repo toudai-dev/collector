@@ -15,7 +15,6 @@ import (
 // Auth data attribute names, read by the gateway processor through
 // client.Info.Auth. The ingestion key is intentionally not among them.
 const (
-	AttrWorkspaceID      = "workspace_id"
 	AttrDatasets         = "datasets"
 	AttrWrite            = "write"
 	AttrRequestedDataset = "requested_dataset"
@@ -49,7 +48,7 @@ func newExtension(cfg *Config) (*authExtension, error) {
 func (e *authExtension) Start(context.Context, component.Host) error { return nil }
 func (e *authExtension) Shutdown(context.Context) error              { return nil }
 
-// Authenticate resolves the key header to a scope and returns a context whose
+// Authenticate resolves the key header to its permissions and returns a context whose
 // client.Info carries it. A key that is unknown, or lacks write permission,
 // fails the request before any pipeline sees data.
 func (e *authExtension) Authenticate(ctx context.Context, headers map[string][]string) (context.Context, error) {
@@ -77,9 +76,8 @@ func (e *authExtension) Authenticate(ctx context.Context, headers map[string][]s
 		return ctx, errMultipleScopes
 	}
 	data := authData{
-		AttrWorkspaceID: sc.workspaceID,
-		AttrDatasets:    append([]string(nil), sc.datasets...),
-		AttrWrite:       sc.write,
+		AttrDatasets: append([]string(nil), sc.datasets...),
+		AttrWrite:    sc.write,
 	}
 	if len(requested) == 1 {
 		data[AttrRequestedDataset] = strings.TrimSpace(requested[0])

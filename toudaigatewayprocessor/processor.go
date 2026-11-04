@@ -47,8 +47,7 @@ func (r *rejection) GRPCStatus() *status.Status { return status.New(r.code, r.ms
 
 // scope is the trusted scope for one request.
 type scope struct {
-	workspaceID string
-	dataset     string
+	dataset string
 }
 
 type gateway struct {
@@ -76,13 +75,15 @@ func requestScope(ctx context.Context) (scope, error) {
 	if auth == nil {
 		return scope{}, errNoIdentity
 	}
-	workspace, _ := auth.GetAttribute(toudaiauthextension.AttrWorkspaceID).(string)
-	if workspace == "" {
+	// Auth data from another authenticator has no write attribute at all; that
+	// is a pipeline misconfiguration, not a producer without permission.
+	write, ok := auth.GetAttribute(toudaiauthextension.AttrWrite).(bool)
+	if !ok {
 		return scope{}, errNoIdentity
 	}
 	// The authenticator already refuses keys without write permission; checking
 	// again keeps a misconfigured authenticator from granting it.
-	if write, _ := auth.GetAttribute(toudaiauthextension.AttrWrite).(bool); !write {
+	if !write {
 		return scope{}, errNoWrite
 	}
 	datasets, _ := auth.GetAttribute(toudaiauthextension.AttrDatasets).([]string)
@@ -93,11 +94,9 @@ func requestScope(ctx context.Context) (scope, error) {
 	case requested == "":
 		return scope{}, errDatasetRequired
 	case !slices.Contains(datasets, requested):
-		// Covers datasets that do not exist and datasets that exist for another
-		// workspace alike; the producer cannot tell them apart.
 		return scope{}, errUnknownDataset
 	}
-	return scope{workspaceID: workspace, dataset: requested}, nil
+	return scope{dataset: requested}, nil
 }
 
 // checkResource rejects a resource that tries to set gateway-owned scope.
@@ -116,10 +115,7 @@ func checkResource(attrs pcommon.Map) error {
 }
 
 func (g *gateway) stampResource(attrs pcommon.Map, sc scope) {
-	attrs.PutStr(reserved.WorkspaceAttr, sc.workspaceID)
 	attrs.PutStr(reserved.DatasetAttr, sc.dataset)
-	// Pipeline-composition marker the exporter requires; not authentication.
-	attrs.PutStr(reserved.ScopeSourceAttr, reserved.ScopeSourceValue)
 }
 
 // stampEvent assigns the record's event_id, replacing anything the producer sent

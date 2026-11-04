@@ -16,7 +16,7 @@ import (
 // longer.
 const minKeyLength = 16
 
-// nameRE bounds workspace and dataset identifiers to a conservative charset so
+// nameRE bounds dataset identifiers to a conservative charset so
 // they are safe in logs, attributes, and ClickHouse string columns.
 var nameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
@@ -25,16 +25,14 @@ type keyFile struct {
 }
 
 type keyEntry struct {
-	WorkspaceID string   `yaml:"workspace_id"`
-	Datasets    []string `yaml:"datasets"`
-	Write       bool     `yaml:"write"`
+	Datasets []string `yaml:"datasets"`
+	Write    bool     `yaml:"write"`
 }
 
-// scope is the trusted scope a key grants.
+// scope is what a key permits.
 type scope struct {
-	workspaceID string
-	datasets    []string
-	write       bool
+	datasets []string
+	write    bool
 }
 
 // keyStore maps the SHA-256 of an ingestion key to its scope. Keying on the
@@ -81,9 +79,6 @@ func parseKeyStore(raw []byte) (keyStore, error) {
 		if len(k) < minKeyLength {
 			return nil, fmt.Errorf("keys_file entry %d: key is shorter than %d characters", i+1, minKeyLength)
 		}
-		if !nameRE.MatchString(e.WorkspaceID) {
-			return nil, fmt.Errorf("keys_file entry %d: workspace_id %q is not a valid identifier", i+1, e.WorkspaceID)
-		}
 		if len(e.Datasets) == 0 {
 			return nil, fmt.Errorf("keys_file entry %d: datasets must list at least one dataset", i+1)
 		}
@@ -98,9 +93,8 @@ func parseKeyStore(raw []byte) (keyStore, error) {
 			seen[d] = true
 		}
 		store[sha256.Sum256([]byte(k))] = scope{
-			workspaceID: e.WorkspaceID,
-			datasets:    append([]string(nil), e.Datasets...),
-			write:       e.Write,
+			datasets: append([]string(nil), e.Datasets...),
+			write:    e.Write,
 		}
 	}
 	return store, nil

@@ -1,6 +1,6 @@
-// Package toudaigatewayprocessor turns the scope authenticated by
-// toudaiauthextension into the trusted attributes the toudai exporter requires,
-// and assigns every record its event_id. It must run before any component that
+// Package toudaigatewayprocessor turns the permissions authenticated by
+// toudaiauthextension into the trusted toudai.dataset attribute the toudai
+// exporter requires, and assigns every record its event_id. It must run before any component that
 // batches or reorders data: scope is per request, and a batch can mix requests.
 package toudaigatewayprocessor
 

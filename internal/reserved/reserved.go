@@ -6,13 +6,10 @@ package reserved
 import "strings"
 
 const (
-	// WorkspaceAttr, DatasetAttr, and ScopeSourceAttr are resource attributes
-	// injected by the gateway from the ingestion key's scope.
-	WorkspaceAttr   = "toudai.workspace_id"
-	DatasetAttr     = "toudai.dataset"
-	ScopeSourceAttr = "toudai.scope_source"
-	// ScopeSourceValue marks a request that went through the gateway processor.
-	ScopeSourceValue = "gateway"
+	// DatasetAttr is the resource attribute holding the dataset the gateway
+	// resolved for the request (Decision 0002 D2/D3). It is the only scope on
+	// the wire: there is no workspace or tenant attribute.
+	DatasetAttr = "toudai.dataset"
 
 	// EventIDAttr is a log-record or span attribute holding the gateway-assigned
 	// event_id (Decision 0001 D5). The exporter consumes it and never stores it

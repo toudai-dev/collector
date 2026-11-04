@@ -47,21 +47,21 @@ for each file in order (upstream `clickhouse/apply-schema.sh` does exactly this)
 ## Gateway
 
 `config/gateway.example.yaml` is the product gateway pipeline: OTLP in, `toudaiauth` and
-`toudaigateway` ahead of any batching, the `toudai` exporter out.
+`toudaigateway` ahead of any batching, the `toudai` exporter out. There is no workspace or tenant:
+one deployment serves one customer, and accounts, workspaces, and the mapping of keys to customers
+belong to a private control plane (Decision 0002).
 
 - **`toudaiauth` extension** validates an ingestion key from the `X-Toudai-Key` header against a
-  static key file (`config/keys.example.yaml`) that maps each key to a `workspace_id`, its allowed
-  datasets, and write permission. A missing, unknown, or read-only key is a 401 before any
-  pipeline runs. The key is held as a digest, removed from receiver metadata, and never appears in
-  auth data, errors, or exported data. Rotation and revocation are file edits plus a restart.
-- **`toudaigateway` processor** sets `toudai.workspace_id`, `toudai.dataset`, and
-  `toudai.scope_source` from the key. The dataset is the `X-Toudai-Dataset` header, or the key's
-  only dataset; a dataset outside the key's list is a 403. A resource that carries any
-  `toudai.*` attribute is a 400. It assigns every log record and span a random UUIDv7 `event_id`,
-  so a producer retry or an identical event always gets a new one.
+  static key file (`config/keys.example.yaml`) that maps each key to its write permission and
+  allowed datasets. A missing, unknown, or read-only key is a 401 before any pipeline runs. The
+  key is held as a digest, removed from receiver metadata, and never appears in auth data,
+  errors, or exported data. Rotation and revocation are file edits plus a restart.
+- **`toudaigateway` processor** sets `toudai.dataset`. The dataset is the `X-Toudai-Dataset`
+  header, or the key's only dataset; a dataset outside the key's list is a 403. A resource that
+  carries any `toudai.*` attribute is a 400. It assigns every log record and span a random UUIDv7
+  `event_id`, so a producer retry or an identical event always gets a new one.
 
-Scope never comes from pipeline configuration, so there is no per-workspace resource processor or
-routing connector. `main_test.go` runs the example through the real receivers over HTTP and gRPC.
+`main_test.go` runs the example through the real receivers over HTTP and gRPC.
 
 ## License
 
