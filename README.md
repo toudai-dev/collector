@@ -24,16 +24,25 @@ which were used for stock-path probes; they can be dropped once nothing needs th
 
 The `toudai` exporter (package `toudaiexporter`) validates a whole export request, writes
 the canonical payload row, then the serving row. Queue, retry, and timeout come from
-`exporterhelper`. Serving rows use the `tenant_id` and `timestamp` columns and carry a
-`routing_epoch` stamp, configurable with `routing_epoch` (default `1`).
+`exporterhelper`. Rows carry no tenant column: one deployment database holds one customer's
+data, and `dataset` is the only scope a row has (Decision 0002). Serving rows use the
+`timestamp` column and carry a `routing_epoch` stamp, configurable with `routing_epoch`
+(default `1`).
 
-The exporter relies on a gateway pipeline that injects the trusted `toudai.workspace_id`,
-`toudai.dataset`, and `toudai.scope_source` resource attributes and a `toudai.event_id` on every
-record before it (see Gateway). It writes the assigned `event_id` as is; a missing or non-UUIDv7
-ID fails the whole export as a permanent error. Nothing is deduplicated (Decision 0001 D5).
+The database is deployment configuration: `database` (default `toudai`; the example gateway
+reads `TOUDAI_CLICKHOUSE_DATABASE`) must name the database the DDL was applied to.
+
+The exporter relies on a gateway pipeline that sets the `toudai.dataset` resource attribute and
+a `toudai.event_id` on every record before it (see Gateway). A resource without a dataset fails
+the whole export as a permanent error. It writes the assigned `event_id` as is; a missing or
+non-UUIDv7 ID also fails the whole export. Nothing is deduplicated (Decision 0001 D5).
 
 `testdata/schema/` vendors the ClickHouse DDL from `toudai-dev/toudai`; a test fails when the
-exporter's INSERT columns drift from it. Each file's header names the source commit.
+exporter's INSERT columns drift from it. Each file's header names the source commit. The DDL
+names the database as the `{database:Identifier}` query parameter, so apply it with the same
+name the exporter uses, for example
+`clickhouse-client --param_database="${TOUDAI_CLICKHOUSE_DATABASE:-toudai}" --multiquery < file.sql`
+for each file in order (upstream `clickhouse/apply-schema.sh` does exactly this).
 
 ## Gateway
 
