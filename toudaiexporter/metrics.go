@@ -44,7 +44,7 @@ func newExporterMetrics(mp metric.MeterProvider) (*exporterMetrics, error) {
 		return nil, err
 	}
 	batches, err := meter.Int64Counter("toudai_exporter_batches",
-		metric.WithDescription("Exported batches, by signal and whether the batch carried more than one workspace."))
+		metric.WithDescription("Exported batches, by signal."))
 	if err != nil {
 		return nil, err
 	}

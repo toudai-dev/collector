@@ -31,7 +31,9 @@ type Config struct {
 
 	// Endpoint is the ClickHouse native-protocol address (host:port).
 	Endpoint string `mapstructure:"endpoint"`
-	// Database holds the serving and canonical tables.
+	// Database holds the serving and canonical tables. It is deployment
+	// configuration (Decision 0002 D1, default toudai) and must name the database
+	// the vendored DDL was applied to with --param_database.
 	Database string `mapstructure:"database"`
 	Username string `mapstructure:"username"`
 	// Password is opaque so a configuration dump cannot print it.
@@ -46,10 +48,10 @@ type Config struct {
 	ServingLogsTable  string `mapstructure:"serving_logs_table"`
 	ServingSpansTable string `mapstructure:"serving_spans_table"`
 
-	// LogBatchSummaries logs one line per export with the batch's workspace and
+	// LogBatchSummaries logs one line per export with the batch's datasets and
 	// event identities. It exists so a test can assert what a single export
-	// actually carried (including mixed-workspace batches) instead of inferring
-	// it from two requests that merely shared a queue.
+	// actually carried (including mixed-dataset batches) instead of inferring it
+	// from two requests that merely shared a queue.
 	LogBatchSummaries bool `mapstructure:"log_batch_summaries"`
 
 	// MaxOpenConns bounds the driver's connection pool.
@@ -57,9 +59,9 @@ type Config struct {
 }
 
 var (
-	errMissingTrustedScope = errors.New("trusted scope is missing: the gateway must inject the toudai workspace/dataset attributes before the exporter")
-	errMissingEventID      = errors.New("event_id is missing: the gateway processor must assign a toudai.event_id to every record before the exporter")
-	errInvalidEventID      = errors.New("event_id is not a canonical UUIDv7")
+	errMissingDataset = errors.New("dataset is missing: the gateway processor must set the toudai.dataset resource attribute before the exporter")
+	errMissingEventID = errors.New("event_id is missing: the gateway processor must assign a toudai.event_id to every record before the exporter")
+	errInvalidEventID = errors.New("event_id is not a canonical UUIDv7")
 )
 
 func defaultConfig() *Config {

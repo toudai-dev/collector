@@ -19,19 +19,16 @@ import (
 	"github.com/toudai-dev/collector/internal/reserved"
 )
 
-// Reserved attribute keys. The gateway processor is the only place trusted scope
-// and event identity are injected; every reserved key that arrives in a
+// Reserved attribute keys. The gateway processor is the only place the dataset
+// and event identity are set; every reserved key that arrives in a
 // producer-controlled namespace (record, scope, span, span scope) is dropped and
-// counted, and the internal scope-source marker is never stored. The gateway
-// event ID is read from the record before that drop and stored only as the
-// event_id column and identity field.
+// counted, and on the resource only toudai.dataset is kept. The gateway event ID
+// is read from the record before that drop and stored only as the event_id
+// column and identity field.
 const (
-	workspaceAttr    = reserved.WorkspaceAttr
-	datasetAttr      = reserved.DatasetAttr
-	scopeSourceAttr  = reserved.ScopeSourceAttr
-	scopeSourceValue = reserved.ScopeSourceValue
-	eventIDAttr      = reserved.EventIDAttr
-	reservedPrefix   = reserved.Prefix
+	datasetAttr    = reserved.DatasetAttr
+	eventIDAttr    = reserved.EventIDAttr
+	reservedPrefix = reserved.Prefix
 )
 
 const canonicalSchema = "toudai.canonical.event/1"
@@ -167,7 +164,7 @@ type attrs struct {
 // decodeAttrs decodes one attribute collection. Reserved keys are dropped when
 // dropReserved is set, which is the rule for every producer-controlled namespace
 // (record, scope, span, span scope). The resource namespace is decoded whole
-// because the gateway's trusted scope arrives there; resourceForStorage applies
+// because the gateway-resolved dataset arrives there; resourceForStorage applies
 // the reserved-key rule afterwards.
 func decodeAttrs(m pcommon.Map, dropReserved bool) (attrs, error) {
 	out := attrs{
@@ -365,7 +362,6 @@ func nilIfEmpty[K comparable, V any](m map[K]V) map[K]V {
 // logRow is one serving log row; spanRow is one serving span row. Both carry the
 // payload checksum so a serving row can be correlated with its canonical row.
 type logRow struct {
-	WorkspaceID    string
 	Dataset        string
 	EventID        string
 	TS             time.Time
@@ -394,10 +390,9 @@ type logRow struct {
 }
 
 type spanRow struct {
-	WorkspaceID string
-	Dataset     string
-	EventID     string
-	TS          time.Time
+	Dataset string
+	EventID string
+	TS      time.Time
 	// EndTS is the supplied end timestamp as received (zero when OTLP carries
 	// no timing); it is kept so a reversed span stays searchable by both
 	// timestamps instead of only by its derived duration.
@@ -430,7 +425,6 @@ type spanRow struct {
 }
 
 type canonicalRow struct {
-	WorkspaceID   string
 	Dataset       string
 	Signal        string
 	EventID       string
@@ -461,39 +455,28 @@ type preparedSpans struct {
 	rejections []rejection
 }
 
-// trustedScope reads the gateway-injected workspace and dataset from a decoded
-// resource namespace and refuses to guess when either is absent, is not a
-// string, or when the gateway's scope-source marker is missing. The marker is a
-// misconfiguration check, not producer authentication: it proves the tested
-// gateway pipeline (credential routing plus the trusted resource processor) ran
-// before the exporter.
-func trustedScope(res attrs) (workspace, dataset string, err error) {
-	wv, ok := res.values[workspaceAttr]
-	if !ok || wv.kind != kindString || wv.s == "" {
-		return "", "", errMissingTrustedScope
-	}
+// resolvedDataset reads the gateway-resolved dataset from a decoded resource
+// namespace and refuses to guess when it is absent or not a string: that means
+// the gateway processor did not run, so the pipeline is misconfigured. Whether
+// the gateway ran is also proven per record by the assigned event ID.
+func resolvedDataset(res attrs) (string, error) {
 	dv, ok := res.values[datasetAttr]
 	if !ok || dv.kind != kindString || dv.s == "" {
-		return "", "", errMissingTrustedScope
+		return "", errMissingDataset
 	}
-	marker, ok := res.values[scopeSourceAttr]
-	if !ok || marker.kind != kindString || marker.s != scopeSourceValue {
-		return "", "", errMissingTrustedScope
-	}
-	return wv.s, dv.s, nil
+	return dv.s, nil
 }
 
 // resourceForStorage applies the reserved-key rule to the resource namespace:
-// the trusted workspace and dataset stay addressable as both columns and
-// attributes, every other reserved key (including the internal scope-source
-// marker) is dropped, and the returned typed values are what the canonical
+// the dataset stays addressable as both a column and an attribute, every other
+// reserved key is dropped, and the returned typed values are what the canonical
 // payload stores.
 func resourceForStorage(res attrs) (values map[string]value, strings_, types map[string]string, dropped []string) {
 	values = map[string]value{}
 	strings_ = map[string]string{}
 	types = map[string]string{}
 	for k, v := range res.values {
-		if strings.HasPrefix(k, reservedPrefix) && k != workspaceAttr && k != datasetAttr {
+		if strings.HasPrefix(k, reservedPrefix) && k != datasetAttr {
 			dropped = append(dropped, k)
 			continue
 		}
@@ -524,9 +507,9 @@ func prepareLogs(ld plog.Logs) preparedLogs {
 			out.rejections = append(out.rejections, rejection{Reason: "invalid_resource_attributes", Detail: err.Error(), Namespace: "resource"})
 			continue
 		}
-		workspace, dataset, err := trustedScope(res)
+		dataset, err := resolvedDataset(res)
 		if err != nil {
-			out.rejections = append(out.rejections, rejection{Reason: "missing_trusted_scope", Detail: err.Error(), Namespace: "resource"})
+			out.rejections = append(out.rejections, rejection{Reason: "missing_dataset", Detail: err.Error(), Namespace: "resource"})
 			continue
 		}
 		resTyped, resValues, resTypes, _ := resourceForStorage(res)
@@ -566,7 +549,6 @@ func prepareLogs(ld plog.Logs) preparedLogs {
 					servedTS = observedRaw
 				}
 				row := logRow{
-					WorkspaceID:    workspace,
 					Dataset:        dataset,
 					TS:             nsTime(servedTS),
 					ObservedTS:     nsTime(observedRaw),
@@ -585,7 +567,6 @@ func prepareLogs(ld plog.Logs) preparedLogs {
 				canonical, err := buildCanonical(canonicalInput{
 					kind:        "log",
 					eventID:     eventID,
-					workspace:   workspace,
 					dataset:     dataset,
 					tsRaw:       tsRaw,
 					observedRaw: observedRaw,
@@ -627,7 +608,7 @@ func prepareLogs(ld plog.Logs) preparedLogs {
 				row.RecordOther = nilIfEmpty(maps.others)
 				out.rows = append(out.rows, row)
 				out.canonical = append(out.canonical, canonicalRow{
-					WorkspaceID: workspace, Dataset: dataset, Signal: "logs", EventID: canonical.eventID,
+					Dataset: dataset, Signal: "logs", EventID: canonical.eventID,
 					TS: row.TS, Payload: canonical.payload, PayloadSHA256: canonical.sha256,
 				})
 			}
@@ -646,9 +627,9 @@ func prepareSpans(td ptrace.Traces) preparedSpans {
 			out.rejections = append(out.rejections, rejection{Reason: "invalid_resource_attributes", Detail: err.Error(), Namespace: "resource"})
 			continue
 		}
-		workspace, dataset, err := trustedScope(res)
+		dataset, err := resolvedDataset(res)
 		if err != nil {
-			out.rejections = append(out.rejections, rejection{Reason: "missing_trusted_scope", Detail: err.Error(), Namespace: "resource"})
+			out.rejections = append(out.rejections, rejection{Reason: "missing_dataset", Detail: err.Error(), Namespace: "resource"})
 			continue
 		}
 		resTyped, resValues, resTypes, _ := resourceForStorage(res)
@@ -696,7 +677,6 @@ func prepareSpans(td ptrace.Traces) preparedSpans {
 					duration = &d
 				}
 				row := spanRow{
-					WorkspaceID:    workspace,
 					Dataset:        dataset,
 					TS:             nsTime(start),
 					EndTS:          nsTime(end),
@@ -717,7 +697,6 @@ func prepareSpans(td ptrace.Traces) preparedSpans {
 				canonical, err := buildCanonical(canonicalInput{
 					kind:        "span",
 					eventID:     eventID,
-					workspace:   workspace,
 					dataset:     dataset,
 					tsRaw:       start,
 					observedRaw: start,
@@ -764,7 +743,7 @@ func prepareSpans(td ptrace.Traces) preparedSpans {
 				row.SpanOther = nilIfEmpty(maps.others)
 				out.rows = append(out.rows, row)
 				out.canonical = append(out.canonical, canonicalRow{
-					WorkspaceID: workspace, Dataset: dataset, Signal: "spans", EventID: canonical.eventID,
+					Dataset: dataset, Signal: "spans", EventID: canonical.eventID,
 					TS: row.TS, Payload: canonical.payload, PayloadSHA256: canonical.sha256,
 				})
 			}
@@ -794,7 +773,6 @@ type spanEnvelope struct {
 type canonicalInput struct {
 	kind         string
 	eventID      string
-	workspace    string
 	dataset      string
 	tsRaw        uint64
 	observedRaw  uint64
@@ -824,9 +802,8 @@ func buildCanonical(in canonicalInput) (canonicalDoc, error) {
 		"schema": canonicalSchema,
 		"kind":   in.kind,
 		"identity": map[string]any{
-			"tenant_id": in.workspace,
-			"dataset":   in.dataset,
-			"event_id":  in.eventID,
+			"dataset":  in.dataset,
+			"event_id": in.eventID,
 		},
 		"time": map[string]any{
 			"timestamp_ns": strconv.FormatUint(in.tsRaw, 10),

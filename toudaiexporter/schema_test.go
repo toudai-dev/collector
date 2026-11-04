@@ -15,7 +15,8 @@ func ddlColumns(t *testing.T, file, table string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	header := "CREATE TABLE IF NOT EXISTS toudai." + table + "\n(\n"
+	// The DDL names its database as a parameter (Decision 0002 D1).
+	header := "CREATE TABLE IF NOT EXISTS {database:Identifier}." + table + "\n(\n"
 	_, body, ok := strings.Cut(string(raw), header)
 	if !ok {
 		t.Fatalf("%s: no %q statement", file, table)

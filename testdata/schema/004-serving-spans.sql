@@ -1,12 +1,7 @@
--- Vendored from github.com/toudai-dev/toudai at 924da955496398446bc230a1585853e424ce53ba
--- (PR #18), clickhouse/schema/004-serving-spans.sql. Identical to the source except
--- that the former product name in identifiers is the Toudai name. Keep the exporter's
--- INSERT columns in sync with it.
 -- Decision 0001 D1/D2/D4: serving rows for spans. Same key, partition, epoch, and
 -- identifier rules as serving_logs.
-CREATE TABLE IF NOT EXISTS toudai.serving_spans
+CREATE TABLE IF NOT EXISTS {database:Identifier}.serving_spans
 (
-    tenant_id String,
     dataset LowCardinality(String),
     event_id String,
     routing_epoch UInt16,
@@ -51,4 +46,4 @@ CREATE TABLE IF NOT EXISTS toudai.serving_spans
 )
 ENGINE = MergeTree
 PARTITION BY toDate(timestamp)
-ORDER BY (tenant_id, dataset, timestamp, event_id);
+ORDER BY (dataset, timestamp, event_id);

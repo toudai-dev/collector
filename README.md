@@ -24,16 +24,22 @@ which were used for stock-path probes; they can be dropped once nothing needs th
 
 The `toudai` exporter (package `toudaiexporter`) validates a whole export request, writes
 the canonical payload row, then the serving row. Queue, retry, and timeout come from
-`exporterhelper`. Serving rows use the `tenant_id` and `timestamp` columns and carry a
-`routing_epoch` stamp, configurable with `routing_epoch` (default `1`).
+`exporterhelper`. One deployment serves one customer (Decision 0002), so rows carry no tenant
+or workspace column: serving rows are keyed by `dataset`, `timestamp`, and `event_id` and carry a
+`routing_epoch` stamp, configurable with `routing_epoch` (default `1`). The ClickHouse database is
+configuration, `database` (default `toudai`), and must be the one the DDL was applied to.
 
-The exporter relies on a gateway pipeline that injects the trusted `toudai.workspace_id`,
-`toudai.dataset`, and `toudai.scope_source` resource attributes and a `toudai.event_id` on every
-record before it (see Gateway). It writes the assigned `event_id` as is; a missing or non-UUIDv7
-ID fails the whole export as a permanent error. Nothing is deduplicated (Decision 0001 D5).
+The exporter relies on a gateway pipeline that sets the `toudai.dataset` resource attribute and a
+`toudai.event_id` on every record before it (see Gateway). It writes the assigned `event_id` as
+is; a missing dataset or a missing or non-UUIDv7 ID fails the whole export as a permanent error.
+Any other `toudai.*` attribute is dropped, never stored. Nothing is deduplicated (Decision 0001
+D5).
 
-`testdata/schema/` vendors the ClickHouse DDL from `toudai-dev/toudai`; a test fails when the
-exporter's INSERT columns drift from it. Each file's header names the source commit.
+`testdata/schema/` vendors the ClickHouse DDL verbatim from `toudai-dev/toudai` at
+`df95068ebccf9e93fcc221088f3566b068ef729c` (PR #27); a test fails when the exporter's INSERT
+columns drift from it. The DDL names its database as the `{database:Identifier}` query parameter,
+so apply it with `clickhouse-client --param_database=<name>` (or the source repository's
+`clickhouse/apply-schema.sh`), using the same name as the exporter's `database`.
 
 ## Gateway
 

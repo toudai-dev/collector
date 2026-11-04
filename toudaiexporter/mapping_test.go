@@ -128,16 +128,14 @@ func TestRecordMapsRouteEachKindOnce(t *testing.T) {
 // fixtureEventID is a canonical UUIDv7 standing in for the gateway-assigned ID.
 const fixtureEventID = "0198a0c4-7b3e-7c11-8a52-3f6d1e9b2a40"
 
-// fixtureLogs builds one log record with the trusted gateway scope and the
+// fixtureLogs builds one log record with the gateway-resolved dataset and the
 // supplied record attributes.
 func fixtureLogs(t *testing.T, record func(plog.LogRecord)) plog.Logs {
 	t.Helper()
 	ld := plog.NewLogs()
 	rl := ld.ResourceLogs().AppendEmpty()
 	res := rl.Resource().Attributes()
-	res.PutStr(workspaceAttr, "11111111-1111-4111-8111-111111111111")
 	res.PutStr(datasetAttr, "fixture")
-	res.PutStr(scopeSourceAttr, scopeSourceValue)
 	res.PutStr("service.name", "fixture-service")
 	sl := rl.ScopeLogs().AppendEmpty()
 	sl.Scope().SetName("toudai.fixture")
@@ -158,55 +156,73 @@ func fixtureLogs(t *testing.T, record func(plog.LogRecord)) plog.Logs {
 // harness with real OTLP protobuf bytes carrying two entries for one key.
 // decodeAttrs detects the duplicate while ranging the collection.
 
-func TestPrepareLogsRejectsMissingTrustedScope(t *testing.T) {
-	ld := plog.NewLogs()
-	rl := ld.ResourceLogs().AppendEmpty()
-	rl.Resource().Attributes().PutStr(workspaceAttr, "producer-supplied")
-	rl.Resource().Attributes().PutStr(datasetAttr, "fixture")
-	sl := rl.ScopeLogs().AppendEmpty()
-	lr := sl.LogRecords().AppendEmpty()
-	lr.SetTimestamp(pcommon.Timestamp(1))
-	prepared := prepareLogs(ld)
-	if len(prepared.rows) != 0 {
-		t.Fatalf("rows = %d, want 0", len(prepared.rows))
+// Without the gateway-resolved dataset the exporter does not guess one, and the
+// whole batch fails as a misconfigured pipeline.
+func TestPrepareLogsRejectsMissingDataset(t *testing.T) {
+	tests := []struct {
+		name     string
+		resource func(pcommon.Map)
+	}{
+		{"absent", func(pcommon.Map) {}},
+		{"empty", func(m pcommon.Map) { m.PutStr(datasetAttr, "") }},
+		{"not a string", func(m pcommon.Map) { m.PutInt(datasetAttr, 1) }},
 	}
-	if _, err := batchInvalidation(prepared.rejections); err == nil {
-		t.Fatalf("rejections = %+v, want the batch to be invalidated without the gateway marker", prepared.rejections)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ld := fixtureLogs(t, nil)
+			res := ld.ResourceLogs().At(0).Resource().Attributes()
+			res.Remove(datasetAttr)
+			tc.resource(res)
+			prepared := prepareLogs(ld)
+			if len(prepared.rows) != 0 {
+				t.Fatalf("rows = %d, want 0", len(prepared.rows))
+			}
+			if reason, err := batchInvalidation(prepared.rejections); err == nil || reason != "missing_dataset" {
+				t.Fatalf("batchInvalidation = %q, %v, want missing_dataset", reason, err)
+			}
+		})
 	}
 }
 
 func TestPrepareLogsDropsProducerReservedKeys(t *testing.T) {
 	ld := fixtureLogs(t, func(lr plog.LogRecord) {
-		lr.Attributes().PutStr("toudai.workspace_id", "99999999-9999-4999-8999-999999999999")
-		lr.Attributes().PutStr("toudai.scope_source", "producer")
+		lr.Attributes().PutStr("toudai.dataset", "forged-record")
 		lr.Attributes().PutStr("normal", "value")
 	})
-	ld.ResourceLogs().At(0).ScopeLogs().At(0).Scope().Attributes().PutStr("toudai.dataset", "forged")
+	rl := ld.ResourceLogs().At(0)
+	// Retired wire attributes (Decision 0002 D2) are reserved keys like any other.
+	rl.Resource().Attributes().PutStr("toudai.workspace_id", "99999999-9999-4999-8999-999999999999")
+	rl.Resource().Attributes().PutStr("toudai.scope_source", "gateway")
+	rl.ScopeLogs().At(0).Scope().Attributes().PutStr("toudai.dataset", "forged-scope")
 	prepared := prepareLogs(ld)
 	if len(prepared.rows) != 1 {
 		t.Fatalf("rows = %d, want 1", len(prepared.rows))
 	}
 	row := prepared.rows[0]
-	if row.WorkspaceID != "11111111-1111-4111-8111-111111111111" {
-		t.Fatalf("workspace = %q, want the gateway value", row.WorkspaceID)
+	if row.Dataset != "fixture" {
+		t.Fatalf("dataset = %q, want the gateway value", row.Dataset)
 	}
-	if _, ok := row.RecordString["toudai.workspace_id"]; ok {
-		t.Fatal("producer record attribute toudai.workspace_id must be dropped")
+	if _, ok := row.RecordString["toudai.dataset"]; ok {
+		t.Fatal("producer record attribute toudai.dataset must be dropped")
 	}
 	if _, ok := row.Scope["toudai.dataset"]; ok {
 		t.Fatal("producer scope attribute toudai.dataset must be dropped")
 	}
-	if row.Resource["toudai.workspace_id"] != "11111111-1111-4111-8111-111111111111" {
-		t.Fatal("stored resource namespace must keep the trusted workspace")
+	if row.Resource["toudai.dataset"] != "fixture" {
+		t.Fatal("stored resource namespace must keep the resolved dataset")
 	}
-	if _, ok := row.Resource[scopeSourceAttr]; ok {
-		t.Fatal("the internal scope-source marker must not be stored")
+	for _, k := range []string{"toudai.workspace_id", "toudai.scope_source"} {
+		if _, ok := row.Resource[k]; ok {
+			t.Fatalf("retired resource attribute %s must not be stored", k)
+		}
 	}
-	if !strings.Contains(row.Payload, `"toudai.workspace_id":{"t":"string","v":"11111111-1111-4111-8111-111111111111"}`) {
-		t.Fatal("canonical resource namespace must carry the trusted workspace")
+	if !strings.Contains(row.Payload, `"toudai.dataset":{"t":"string","v":"fixture"}`) {
+		t.Fatal("canonical resource namespace must carry the resolved dataset")
 	}
-	if strings.Contains(row.Payload, "9999999999") {
-		t.Fatal("canonical payload must not contain the forged workspace value")
+	for _, forged := range []string{"9999999999", "forged-", "workspace", "scope_source"} {
+		if strings.Contains(row.Payload, forged) {
+			t.Fatalf("canonical payload contains %q", forged)
+		}
 	}
 }
 
@@ -219,9 +235,7 @@ func TestSpanTimingStatusAndPreservedTimestamps(t *testing.T) {
 		td := ptrace.NewTraces()
 		rs := td.ResourceSpans().AppendEmpty()
 		res := rs.Resource().Attributes()
-		res.PutStr(workspaceAttr, "ws")
 		res.PutStr(datasetAttr, "fixture")
-		res.PutStr(scopeSourceAttr, scopeSourceValue)
 		ss := rs.ScopeSpans().AppendEmpty()
 		sp := ss.Spans().AppendEmpty()
 		sp.Attributes().PutStr(eventIDAttr, fixtureEventID)
@@ -365,9 +379,7 @@ func TestSpansRequireAssignedEventID(t *testing.T) {
 	td := ptrace.NewTraces()
 	rs := td.ResourceSpans().AppendEmpty()
 	res := rs.Resource().Attributes()
-	res.PutStr(workspaceAttr, "ws")
 	res.PutStr(datasetAttr, "fixture")
-	res.PutStr(scopeSourceAttr, scopeSourceValue)
 	spans := rs.ScopeSpans().AppendEmpty().Spans()
 	spans.AppendEmpty().Attributes().PutStr(eventIDAttr, fixtureEventID)
 	spans.AppendEmpty() // no event ID
@@ -391,8 +403,9 @@ func TestCanonicalPayloadMatchesIndependentShape(t *testing.T) {
 		t.Fatalf("payload is not JSON: %v", err)
 	}
 	identity := doc["identity"].(map[string]any)
-	if identity["tenant_id"] != "11111111-1111-4111-8111-111111111111" || identity["dataset"] != "fixture" {
-		t.Fatalf("identity = %v", identity)
+	// Decision 0002 D2: the identity block is (dataset, event_id) only.
+	if len(identity) != 2 || identity["dataset"] != "fixture" {
+		t.Fatalf("identity = %v, want only dataset and event_id", identity)
 	}
 	if identity["event_id"] != prepared.rows[0].EventID {
 		t.Fatal("payload identity.event_id does not match the row identity")

@@ -61,9 +61,9 @@ func (e *toudaiExporter) shutdown(_ context.Context) error {
 // write, so a later invalid record cannot leave the canonical destination
 // written and the serving destination missing. Validation failures are counted
 // per record and excluded from both destinations; the remaining records are
-// exported. A batch that is missing its gateway-injected scope is rejected as a
-// whole with a permanent error (fail closed), because it means the pipeline is
-// misconfigured rather than that one producer record is bad.
+// exported. A batch that is missing its gateway-set dataset or event IDs is
+// rejected as a whole with a permanent error (fail closed), because it means the
+// pipeline is misconfigured rather than that one producer record is bad.
 func (e *toudaiExporter) pushLogs(ctx context.Context, ld plog.Logs) error {
 	prepared := prepareLogs(ld)
 	e.recordRejections(ctx, "logs", prepared.rejections)
@@ -78,7 +78,7 @@ func (e *toudaiExporter) pushLogs(ctx context.Context, ld plog.Logs) error {
 		e.metrics.rejectedBatches.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", "logs"), attribute.String("reason", reason)))
 		return consumererror.NewPermanent(err)
 	}
-	e.logBatchSummary(ctx, "logs", len(prepared.rows), prepared.rejections, logWorkspaces(prepared.rows), logEventIDs(prepared.rows))
+	e.logBatchSummary(ctx, "logs", len(prepared.rows), prepared.rejections, logDatasets(prepared.rows), logEventIDs(prepared.rows))
 	if err := e.insertCanonical(ctx, prepared.canonical); err != nil {
 		e.metrics.insertFailures.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", "logs"), attribute.String("destination", "canonical")))
 		return fmt.Errorf("canonical insert failed: %w", err)
@@ -110,7 +110,7 @@ func (e *toudaiExporter) pushTraces(ctx context.Context, td ptrace.Traces) error
 		e.metrics.rejectedBatches.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", "spans"), attribute.String("reason", reason)))
 		return consumererror.NewPermanent(err)
 	}
-	e.logBatchSummary(ctx, "spans", len(prepared.rows), prepared.rejections, spanWorkspaces(prepared.rows), spanEventIDs(prepared.rows))
+	e.logBatchSummary(ctx, "spans", len(prepared.rows), prepared.rejections, spanDatasets(prepared.rows), spanEventIDs(prepared.rows))
 	if err := e.insertCanonical(ctx, prepared.canonical); err != nil {
 		e.metrics.insertFailures.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", "spans"), attribute.String("destination", "canonical")))
 		return fmt.Errorf("canonical insert failed: %w", err)
@@ -131,8 +131,8 @@ func (e *toudaiExporter) pushTraces(ctx context.Context, td ptrace.Traces) error
 func batchInvalidation(rejections []rejection) (reason string, err error) {
 	for _, r := range rejections {
 		switch r.Reason {
-		case "missing_trusted_scope":
-			return r.Reason, errMissingTrustedScope
+		case "missing_dataset":
+			return r.Reason, errMissingDataset
 		case "missing_event_id":
 			return r.Reason, errMissingEventID
 		case "invalid_event_id":
@@ -155,9 +155,8 @@ func (e *toudaiExporter) recordRejections(ctx context.Context, signal string, re
 	}
 }
 
-func (e *toudaiExporter) logBatchSummary(ctx context.Context, signal string, records int, rejections []rejection, workspaces, eventIDs []string) {
-	mixed := len(workspaces) > 1
-	e.metrics.batches.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", signal), attribute.Bool("cross_workspace", mixed)))
+func (e *toudaiExporter) logBatchSummary(ctx context.Context, signal string, records int, rejections []rejection, datasets, eventIDs []string) {
+	e.metrics.batches.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", signal)))
 	if !e.cfg.LogBatchSummaries {
 		return
 	}
@@ -165,19 +164,18 @@ func (e *toudaiExporter) logBatchSummary(ctx context.Context, signal string, rec
 		zap.String("signal", signal),
 		zap.Int("records", records),
 		zap.Int("rejected", len(rejections)),
-		zap.Bool("cross_workspace", mixed),
-		zap.Strings("workspaces", workspaces),
+		zap.Strings("datasets", datasets),
 		zap.Strings("event_ids", eventIDs),
 	)
 }
 
-func logWorkspaces(rows []logRow) []string {
+func logDatasets(rows []logRow) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, r := range rows {
-		if !seen[r.WorkspaceID] {
-			seen[r.WorkspaceID] = true
-			out = append(out, r.WorkspaceID)
+		if !seen[r.Dataset] {
+			seen[r.Dataset] = true
+			out = append(out, r.Dataset)
 		}
 	}
 	return out
@@ -191,13 +189,13 @@ func logEventIDs(rows []logRow) []string {
 	return out
 }
 
-func spanWorkspaces(rows []spanRow) []string {
+func spanDatasets(rows []spanRow) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, r := range rows {
-		if !seen[r.WorkspaceID] {
-			seen[r.WorkspaceID] = true
-			out = append(out, r.WorkspaceID)
+		if !seen[r.Dataset] {
+			seen[r.Dataset] = true
+			out = append(out, r.Dataset)
 		}
 	}
 	return out
@@ -211,16 +209,16 @@ func spanEventIDs(rows []spanRow) []string {
 	return out
 }
 
-// Column lists of the Decision 0001 DDL in clickhouse/schema, in the order the
-// batch appends below supply values. schema_test.go fails if a list drifts from
-// the DDL. The Go row structs keep their experiment-era field names (WorkspaceID,
-// TS); the stored columns are tenant_id and timestamp.
+// Column lists of the Decision 0001 DDL in clickhouse/schema (without the tenant
+// column, Decision 0002 D2), in the order the batch appends below supply values.
+// schema_test.go fails if a list drifts from the DDL. The Go row structs keep
+// their experiment-era field name TS; the stored column is timestamp.
 var (
-	canonicalColumns = []string{"tenant_id", "dataset", "signal", "event_id", "timestamp", "schema_version", "payload", "payload_sha256"}
+	canonicalColumns = []string{"dataset", "signal", "event_id", "timestamp", "schema_version", "payload", "payload_sha256"}
 
-	servingLogsColumns = []string{"tenant_id", "dataset", "event_id", "routing_epoch", "timestamp", "observed_ts", "kind", "service_name", "severity_text", "severity_number", "body", "trace_id", "span_id", "event_name", "resource", "scope", "resource_types", "scope_types", "record_int", "record_double", "record_string", "record_bool", "record_other", "payload_sha256"}
+	servingLogsColumns = []string{"dataset", "event_id", "routing_epoch", "timestamp", "observed_ts", "kind", "service_name", "severity_text", "severity_number", "body", "trace_id", "span_id", "event_name", "resource", "scope", "resource_types", "scope_types", "record_int", "record_double", "record_string", "record_bool", "record_other", "payload_sha256"}
 
-	servingSpansColumns = []string{"tenant_id", "dataset", "event_id", "routing_epoch", "timestamp", "end_ts", "kind", "service_name", "trace_id", "span_id", "parent_span_id", "span_name", "span_kind", "status_code", "duration_ns", "span_timing_status", "resource", "resource_types", "span_scope", "span_scope_types", "span_int", "span_double", "span_string", "span_bool", "span_other", "payload_sha256"}
+	servingSpansColumns = []string{"dataset", "event_id", "routing_epoch", "timestamp", "end_ts", "kind", "service_name", "trace_id", "span_id", "parent_span_id", "span_name", "span_kind", "status_code", "duration_ns", "span_timing_status", "resource", "resource_types", "span_scope", "span_scope_types", "span_int", "span_double", "span_string", "span_bool", "span_other", "payload_sha256"}
 )
 
 func insertStatement(table string, columns []string) string {
@@ -236,7 +234,7 @@ func (e *toudaiExporter) insertCanonical(ctx context.Context, rows []canonicalRo
 		return err
 	}
 	for _, r := range rows {
-		if err := batch.Append(r.WorkspaceID, r.Dataset, r.Signal, r.EventID, r.TS, canonicalSchema, r.Payload, r.PayloadSHA256); err != nil {
+		if err := batch.Append(r.Dataset, r.Signal, r.EventID, r.TS, canonicalSchema, r.Payload, r.PayloadSHA256); err != nil {
 			return err
 		}
 	}
@@ -252,7 +250,7 @@ func (e *toudaiExporter) insertServingLogs(ctx context.Context, rows []logRow) e
 		return err
 	}
 	for _, r := range rows {
-		if err := batch.Append(r.WorkspaceID, r.Dataset, r.EventID, e.cfg.RoutingEpoch, r.TS, r.ObservedTS, "log", r.ServiceName,
+		if err := batch.Append(r.Dataset, r.EventID, e.cfg.RoutingEpoch, r.TS, r.ObservedTS, "log", r.ServiceName,
 			r.SeverityText, r.SeverityNumber, r.Body, r.TraceID, r.SpanID, r.EventName,
 			r.Resource, r.Scope, r.ResourceTypes, r.ScopeTypes,
 			r.RecordInt, r.RecordDouble, r.RecordString, r.RecordBool, r.RecordOther, r.PayloadSHA256); err != nil {
@@ -271,7 +269,7 @@ func (e *toudaiExporter) insertServingSpans(ctx context.Context, rows []spanRow)
 		return err
 	}
 	for _, r := range rows {
-		if err := batch.Append(r.WorkspaceID, r.Dataset, r.EventID, e.cfg.RoutingEpoch, r.TS, r.EndTS, "span", r.ServiceName,
+		if err := batch.Append(r.Dataset, r.EventID, e.cfg.RoutingEpoch, r.TS, r.EndTS, "span", r.ServiceName,
 			r.TraceID, r.SpanID, r.ParentID, r.SpanName, r.SpanKind, r.StatusCode, r.DurationNS, r.TimingStatus,
 			r.Resource, r.ResourceTypes, r.SpanScope, r.SpanScopeTypes,
 			r.SpanInt, r.SpanDouble, r.SpanString, r.SpanBool, r.SpanOther, r.PayloadSHA256); err != nil {
