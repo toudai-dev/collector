@@ -47,18 +47,24 @@ so apply it with `clickhouse-client --param_database=<name>` (or the source repo
 `toudaigateway` ahead of any batching, the `toudai` exporter out.
 
 - **`toudaiauth` extension** validates an ingestion key from the `X-Toudai-Key` header against a
-  static key file (`config/keys.example.yaml`) that maps each key to a `workspace_id`, its allowed
-  datasets, and write permission. A missing, unknown, or read-only key is a 401 before any
-  pipeline runs. The key is held as a digest, removed from receiver metadata, and never appears in
-  auth data, errors, or exported data. Rotation and revocation are file edits plus a restart.
-- **`toudaigateway` processor** sets `toudai.workspace_id`, `toudai.dataset`, and
-  `toudai.scope_source` from the key. The dataset is the `X-Toudai-Dataset` header, or the key's
-  only dataset; a dataset outside the key's list is a 403. A resource that carries any
-  `toudai.*` attribute is a 400. It assigns every log record and span a random UUIDv7 `event_id`,
-  so a producer retry or an identical event always gets a new one.
+  static key file (`config/keys.example.yaml`). A key maps to permissions, never to a customer or
+  workspace (Decision 0002 D3): write permission and an optional list of datasets. A key without
+  a `datasets` field may write any dataset; an explicit empty `datasets: []` is refused at start.
+  A missing, unknown, repeated, or read-only key, or a blank or repeated `X-Toudai-Dataset`
+  header, is a 401 before any pipeline runs. The key is held as a digest, removed from receiver
+  metadata, and never appears in auth data, errors, or exported data. Rotation and revocation are
+  file edits plus a restart.
+- **`toudaigateway` processor** resolves the request's dataset: the `X-Toudai-Dataset` header, else
+  the key's only dataset, else `default_dataset` (empty by default, `TOUDAI_DEFAULT_DATASET` in the
+  example). A dataset outside the key's list is a 403; no resolvable dataset or an invalid name is
+  a 400. It sets `toudai.dataset` on every resource. A producer `toudai.dataset` on the resource is
+  accepted only when it equals the resolved dataset; any other `toudai.*` resource attribute
+  (including the retired `toudai.workspace_id` and `toudai.scope_source`) and any producer
+  `toudai.event_id` on a record is a 400. It assigns every log record and span a random UUIDv7
+  `event_id` before batching, so a producer retry or an identical event always gets a new one.
 
-Scope never comes from pipeline configuration, so there is no per-workspace resource processor or
-routing connector. `main_test.go` runs the example through the real receivers over HTTP and gRPC.
+Dataset resolution is write-side only; reads name their dataset explicitly in the query service.
+`main_test.go` runs the example through the real receivers over HTTP and gRPC.
 
 ## License
 

@@ -10,39 +10,38 @@ import (
 	"sort"
 
 	"go.yaml.in/yaml/v3"
+
+	"github.com/toudai-dev/collector/internal/reserved"
 )
 
 // minKeyLength rejects keys short enough to be guessed; generated keys are far
 // longer.
 const minKeyLength = 16
 
-// nameRE bounds workspace and dataset identifiers to a conservative charset so
-// they are safe in logs, attributes, and ClickHouse string columns.
-var nameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
-
 type keyFile struct {
 	Keys map[string]keyEntry `yaml:"keys"`
 }
 
+// keyEntry is what a key grants. Keys map to permissions, never to a customer:
+// the deployment already is the customer (Decision 0002 D3).
 type keyEntry struct {
-	WorkspaceID string   `yaml:"workspace_id"`
-	Datasets    []string `yaml:"datasets"`
-	Write       bool     `yaml:"write"`
+	// Datasets optionally restricts the key; empty means any dataset.
+	Datasets []string `yaml:"datasets"`
+	Write    bool     `yaml:"write"`
 }
 
-// scope is the trusted scope a key grants.
-type scope struct {
-	workspaceID string
-	datasets    []string
-	write       bool
+// grant is the permission a key carries.
+type grant struct {
+	datasets []string // nil: unrestricted
+	write    bool
 }
 
-// keyStore maps the SHA-256 of an ingestion key to its scope. Keying on the
+// keyStore maps the SHA-256 of an ingestion key to its grant. Keying on the
 // digest keeps raw keys out of long-lived memory and makes lookups independent
 // of how many leading bytes a guess shares with a real key.
-type keyStore map[[sha256.Size]byte]scope
+type keyStore map[[sha256.Size]byte]grant
 
-func (s keyStore) lookup(key string) (scope, bool) {
+func (s keyStore) lookup(key string) (grant, bool) {
 	sc, ok := s[sha256.Sum256([]byte(key))]
 	return sc, ok
 }
@@ -61,6 +60,8 @@ func parseKeyStore(raw []byte) (keyStore, error) {
 	var kf keyFile
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
 	// Unknown fields would silently drop a misspelled permission, so they fail.
+	// That includes the retired workspace_id (Decision 0002), so a key file
+	// written for the multi-tenant gateway fails at start instead of loading.
 	dec.KnownFields(true)
 	if err := dec.Decode(&kf); err != nil {
 		return nil, yamlError(err)
@@ -81,15 +82,15 @@ func parseKeyStore(raw []byte) (keyStore, error) {
 		if len(k) < minKeyLength {
 			return nil, fmt.Errorf("keys_file entry %d: key is shorter than %d characters", i+1, minKeyLength)
 		}
-		if !nameRE.MatchString(e.WorkspaceID) {
-			return nil, fmt.Errorf("keys_file entry %d: workspace_id %q is not a valid identifier", i+1, e.WorkspaceID)
-		}
-		if len(e.Datasets) == 0 {
-			return nil, fmt.Errorf("keys_file entry %d: datasets must list at least one dataset", i+1)
+		// An omitted list means any dataset. An explicit empty list is refused
+		// rather than read the same way: an operator who writes `datasets: []`
+		// to mean "none yet" or "revoked" must not get an unrestricted key.
+		if e.Datasets != nil && len(e.Datasets) == 0 {
+			return nil, fmt.Errorf("keys_file entry %d: datasets is empty; omit it for a key that may write any dataset", i+1)
 		}
 		seen := make(map[string]bool, len(e.Datasets))
 		for _, d := range e.Datasets {
-			if !nameRE.MatchString(d) {
+			if !reserved.ValidDataset(d) {
 				return nil, fmt.Errorf("keys_file entry %d: dataset %q is not a valid identifier", i+1, d)
 			}
 			if seen[d] {
@@ -97,11 +98,7 @@ func parseKeyStore(raw []byte) (keyStore, error) {
 			}
 			seen[d] = true
 		}
-		store[sha256.Sum256([]byte(k))] = scope{
-			workspaceID: e.WorkspaceID,
-			datasets:    append([]string(nil), e.Datasets...),
-			write:       e.Write,
-		}
+		store[sha256.Sum256([]byte(k))] = grant{datasets: e.Datasets, write: e.Write}
 	}
 	return store, nil
 }

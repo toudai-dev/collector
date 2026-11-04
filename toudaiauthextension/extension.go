@@ -15,7 +15,12 @@ import (
 // Auth data attribute names, read by the gateway processor through
 // client.Info.Auth. The ingestion key is intentionally not among them.
 const (
-	AttrWorkspaceID      = "workspace_id"
+	// AttrAuthenticator marks auth data as this extension's, with the value
+	// AuthenticatorName, so the gateway processor never reads permissions out of
+	// another authenticator's attributes that happen to share a name.
+	AttrAuthenticator = "authenticator"
+	AuthenticatorName = "toudaiauth"
+	// AttrDatasets is the key's dataset list; nil means any dataset.
 	AttrDatasets         = "datasets"
 	AttrWrite            = "write"
 	AttrRequestedDataset = "requested_dataset"
@@ -24,11 +29,12 @@ const (
 // Errors are fixed strings: HTTP receivers return them to the client verbatim,
 // and none may carry the supplied key.
 var (
-	errMissingKey     = errors.New("missing ingestion key")
-	errInvalidKey     = errors.New("invalid ingestion key")
-	errMultipleKeys   = errors.New("multiple ingestion keys supplied")
-	errNoWrite        = errors.New("ingestion key lacks write permission")
-	errMultipleScopes = errors.New("multiple dataset headers supplied")
+	errMissingKey       = errors.New("missing ingestion key")
+	errInvalidKey       = errors.New("invalid ingestion key")
+	errMultipleKeys     = errors.New("multiple ingestion keys supplied")
+	errNoWrite          = errors.New("ingestion key lacks write permission")
+	errMultipleDatasets = errors.New("multiple dataset headers supplied")
+	errEmptyDataset     = errors.New("dataset header is empty")
 )
 
 type authExtension struct {
@@ -49,8 +55,8 @@ func newExtension(cfg *Config) (*authExtension, error) {
 func (e *authExtension) Start(context.Context, component.Host) error { return nil }
 func (e *authExtension) Shutdown(context.Context) error              { return nil }
 
-// Authenticate resolves the key header to a scope and returns a context whose
-// client.Info carries it. A key that is unknown, or lacks write permission,
+// Authenticate resolves the key header to its permissions and returns a context
+// whose client.Info carries them. A key that is unknown, or lacks write permission,
 // fails the request before any pipeline sees data.
 func (e *authExtension) Authenticate(ctx context.Context, headers map[string][]string) (context.Context, error) {
 	keys := headerValues(headers, e.cfg.KeyHeader)
@@ -65,24 +71,31 @@ func (e *authExtension) Authenticate(ctx context.Context, headers map[string][]s
 	if key == "" {
 		return ctx, errMissingKey
 	}
-	sc, ok := e.store.lookup(key)
+	g, ok := e.store.lookup(key)
 	if !ok {
 		return ctx, errInvalidKey
 	}
-	if !sc.write {
+	if !g.write {
 		return ctx, errNoWrite
 	}
 	requested := headerValues(headers, e.cfg.DatasetHeader)
 	if len(requested) > 1 {
-		return ctx, errMultipleScopes
+		return ctx, errMultipleDatasets
 	}
 	data := authData{
-		AttrWorkspaceID: sc.workspaceID,
-		AttrDatasets:    append([]string(nil), sc.datasets...),
-		AttrWrite:       sc.write,
+		AttrAuthenticator: AuthenticatorName,
+		AttrDatasets:      g.datasets,
+		AttrWrite:         g.write,
 	}
 	if len(requested) == 1 {
-		data[AttrRequestedDataset] = strings.TrimSpace(requested[0])
+		// A header that is present but blank (an unset template variable, say)
+		// is refused rather than read as "no header", which would silently
+		// write to the fallback dataset.
+		ds := strings.TrimSpace(requested[0])
+		if ds == "" {
+			return ctx, errEmptyDataset
+		}
+		data[AttrRequestedDataset] = ds
 	}
 
 	info := client.FromContext(ctx)
@@ -137,8 +150,8 @@ type authData map[string]any
 
 func (a authData) GetAttribute(name string) any {
 	v := a[name]
-	// Callers must not be able to mutate the shared scope.
-	if ds, ok := v.([]string); ok {
+	// Callers must not be able to mutate the key's shared dataset list.
+	if ds, ok := v.([]string); ok && ds != nil {
 		return append([]string(nil), ds...)
 	}
 	return v

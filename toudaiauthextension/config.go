@@ -1,10 +1,11 @@
 // Package toudaiauthextension authenticates producers by an ingestion key sent
-// in a request header and publishes the key's trusted scope (workspace, allowed
-// datasets, write permission) as client auth data for the gateway processor.
+// in a request header and publishes what the key permits (write permission and
+// an optional dataset list) as client auth data for the gateway processor.
 //
-// It deliberately owns no routing or attribute injection: it answers "who is
-// this key", and toudaigatewayprocessor turns that answer into scope on the
-// data. The key itself is never placed in auth data, errors, or metadata.
+// A key maps to permissions, never to a customer or workspace: one deployment
+// serves one customer (Decision 0002 D3). The extension owns no attribute
+// injection; toudaigatewayprocessor resolves the request's dataset from these
+// permissions. The key itself is never placed in auth data, errors, or metadata.
 package toudaiauthextension
 
 import (
@@ -14,14 +15,15 @@ import (
 
 // Config configures the extension.
 type Config struct {
-	// KeysFile is the static key file: ingestion key to workspace, datasets, and
-	// write permission. It is read once at start; rotation is a file change plus
+	// KeysFile is the static key file: ingestion key to write permission and an
+	// optional dataset list. It is read once at start; rotation is a file change plus
 	// restart until dynamic resolution exists.
 	KeysFile string `mapstructure:"keys_file"`
 	// KeyHeader is the request header carrying the ingestion key.
 	KeyHeader string `mapstructure:"key_header"`
 	// DatasetHeader optionally names the dataset a request writes to. Without it
-	// a key scoped to exactly one dataset writes there.
+	// the gateway processor falls back to the key's only dataset, then to its
+	// configured default.
 	DatasetHeader string `mapstructure:"dataset_header"`
 }
 

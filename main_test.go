@@ -29,12 +29,10 @@ const (
 	exampleKeys   = "config/keys.example.yaml"
 
 	// Synthetic keys from config/keys.example.yaml.
-	keyWSAProd     = "tk_example_ws_a_prod_0123456789abcdef"
-	keyWSAMulti    = "tk_example_ws_a_multi_0123456789abcdef"
-	keyWSBProd     = "tk_example_ws_b_prod_0123456789abcdef"
-	keyWSAReadonly = "tk_example_ws_a_readonly_0123456789ab"
-	wsA            = "11111111-1111-4111-8111-111111111111"
-	wsB            = "22222222-2222-4222-8222-222222222222"
+	keyProd     = "tk_example_prod_only_0123456789abcdef"
+	keyTwo      = "tk_example_prod_staging_0123456789abcd"
+	keyAny      = "tk_example_any_dataset_0123456789abcde"
+	keyReadonly = "tk_example_readonly_0123456789abcdef"
 )
 
 func freeAddr(t *testing.T) string {
@@ -62,8 +60,9 @@ func TestExampleGatewayConfigIsValid(t *testing.T) {
 // gateway runs the distribution in-process with the example gateway config,
 // swapping only the destination (the toudai exporter needs ClickHouse) for a
 // file exporter. Everything between the receiver and the exporter is the
-// example config as shipped.
-func gateway(t *testing.T) (baseURL, grpcAddr, outFile string) {
+// example config as shipped, with default_dataset set through its environment
+// variable ("" for none).
+func gateway(t *testing.T, defaultDataset string) (baseURL, grpcAddr, outFile string) {
 	t.Helper()
 	dir := t.TempDir()
 	outFile = filepath.Join(dir, "out.jsonl")
@@ -91,6 +90,7 @@ service:
 	t.Setenv("TOUDAI_OTLP_HTTP_ENDPOINT", httpAddr)
 	t.Setenv("TOUDAI_OTLP_GRPC_ENDPOINT", grpcAddr)
 	t.Setenv("TOUDAI_KEYS_FILE", exampleKeys)
+	t.Setenv("TOUDAI_DEFAULT_DATASET", defaultDataset)
 
 	set := collectorSettings()
 	set.DisableGracefulShutdown = true
@@ -213,54 +213,82 @@ func asStrings(m map[string]any) map[string]string {
 }
 
 // Through the real receiver, auth extension, and gateway processor from the
-// example config: what is accepted carries key-derived scope and fresh IDs, and
-// everything else is refused with the right status and writes nothing.
+// example config: what is accepted carries the resolved dataset and a fresh ID,
+// and everything else is refused with the right status and writes nothing.
 func TestGatewayIngestion(t *testing.T) {
-	base, _, outFile := gateway(t)
 	tests := []struct {
-		name       string
-		headers    map[string]string
-		resource   string // extra resource attributes (JSON list items, leading comma)
-		record     string
-		wantStatus int
-		wantWS     string
-		wantDS     string
+		name           string
+		defaultDataset string
+		headers        map[string]string
+		resource       string // extra resource attributes (JSON list items, leading comma)
+		record         string
+		wantStatus     int
+		wantDS         string
 	}{
-		{"accepted, single-dataset key", map[string]string{"X-Toudai-Key": keyWSAProd}, "", "", 200, wsA, "prod"},
-		{"accepted, other workspace", map[string]string{"X-Toudai-Key": keyWSBProd}, "", "", 200, wsB, "prod"},
-		{"accepted, multi-dataset key names its dataset", map[string]string{"X-Toudai-Key": keyWSAMulti, "X-Toudai-Dataset": "staging"}, "", "", 200, wsA, "staging"},
-		{"unknown dataset", map[string]string{"X-Toudai-Key": keyWSAMulti, "X-Toudai-Dataset": "nope"}, "", "", 403, "", ""},
-		{"dataset belonging only to another key", map[string]string{"X-Toudai-Key": keyWSBProd, "X-Toudai-Dataset": "staging"}, "", "", 403, "", ""},
-		{"multi-dataset key without a dataset", map[string]string{"X-Toudai-Key": keyWSAMulti}, "", "", 400, "", ""},
-		{"override attempt: workspace on resource", map[string]string{"X-Toudai-Key": keyWSAProd}, `,{"key":"toudai.workspace_id","value":{"stringValue":"` + wsB + `"}}`, "", 400, "", ""},
-		{"override attempt: dataset on resource", map[string]string{"X-Toudai-Key": keyWSAProd}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 400, "", ""},
-		{"override attempt: forged scope marker", map[string]string{"X-Toudai-Key": keyWSAProd}, `,{"key":"toudai.scope_source","value":{"stringValue":"gateway"}}`, "", 400, "", ""},
-		{"missing key", nil, "", "", 401, "", ""},
-		{"unknown key", map[string]string{"X-Toudai-Key": "tk_example_not_a_real_key_000"}, "", "", 401, "", ""},
-		{"read-only key", map[string]string{"X-Toudai-Key": keyWSAReadonly}, "", "", 401, "", ""},
-		{"authorization header is not an ingestion key", map[string]string{"Authorization": "Bearer " + keyWSAProd}, "", "", 401, "", ""},
+		// Dataset precedence: header, else the key's only dataset, else default.
+		{"key's only dataset", "staging", map[string]string{"X-Toudai-Key": keyProd}, "", "", 200, "prod"},
+		{"header", "staging", map[string]string{"X-Toudai-Key": keyTwo, "X-Toudai-Dataset": "prod"}, "", "", 200, "prod"},
+		{"default for a key with several datasets", "staging", map[string]string{"X-Toudai-Key": keyTwo}, "", "", 200, "staging"},
+		{"default for an unrestricted key", "staging", map[string]string{"X-Toudai-Key": keyAny}, "", "", 200, "staging"},
+		{"header for an unrestricted key", "staging", map[string]string{"X-Toudai-Key": keyAny, "X-Toudai-Dataset": "custom"}, "", "", 200, "custom"},
+		{"no header and no default", "", map[string]string{"X-Toudai-Key": keyTwo}, "", "", 400, ""},
+		// The key's list bounds every source.
+		{"header outside a single-dataset key", "staging", map[string]string{"X-Toudai-Key": keyProd, "X-Toudai-Dataset": "staging"}, "", "", 403, ""},
+		{"header outside the list", "staging", map[string]string{"X-Toudai-Key": keyTwo, "X-Toudai-Dataset": "nope"}, "", "", 403, ""},
+		{"default outside the list", "other", map[string]string{"X-Toudai-Key": keyTwo}, "", "", 403, ""},
+		{"invalid dataset name", "", map[string]string{"X-Toudai-Key": keyAny, "X-Toudai-Dataset": "a b"}, "", "", 400, ""},
+		// Producer toudai.* attributes.
+		{"matching resource dataset", "", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.dataset","value":{"stringValue":"prod"}}`, "", 200, "prod"},
+		{"mismatching resource dataset", "", map[string]string{"X-Toudai-Key": keyTwo, "X-Toudai-Dataset": "prod"}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 400, ""},
+		{"retired workspace on resource", "", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.workspace_id","value":{"stringValue":"22222222-2222-4222-8222-222222222222"}}`, "", 400, ""},
+		{"retired scope marker on resource", "", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.scope_source","value":{"stringValue":"gateway"}}`, "", 400, ""},
+		{"producer event ID on record", "", map[string]string{"X-Toudai-Key": keyProd}, "", `{"key":"toudai.event_id","value":{"stringValue":"00000000-0000-7000-8000-000000000000"}}`, 400, ""},
+		// Keys.
+		{"missing key", "staging", nil, "", "", 401, ""},
+		{"unknown key", "staging", map[string]string{"X-Toudai-Key": "tk_example_not_a_real_key_000"}, "", "", 401, ""},
+		{"read-only key", "staging", map[string]string{"X-Toudai-Key": keyReadonly}, "", "", 401, ""},
+		// A blank header must not silently fall back to the default dataset.
+		{"blank dataset header", "staging", map[string]string{"X-Toudai-Key": keyAny, "X-Toudai-Dataset": " "}, "", "", 401, ""},
+		{"authorization header is not an ingestion key", "staging", map[string]string{"Authorization": "Bearer " + keyProd}, "", "", 401, ""},
 	}
-	accepted := 0
+	// One gateway per default, so the default comes from the config as shipped.
+	type instance struct {
+		base, outFile string
+		accepted      int
+	}
+	gateways := map[string]*instance{}
+	for _, tc := range tests {
+		if gateways[tc.defaultDataset] == nil {
+			base, _, outFile := gateway(t, tc.defaultDataset)
+			gateways[tc.defaultDataset] = &instance{base: base, outFile: outFile}
+		}
+	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			status, body := post(t, base+"/v1/logs", fmt.Sprintf(logBody, tc.resource, tc.record), tc.headers)
+			g := gateways[tc.defaultDataset]
+			status, body := post(t, g.base+"/v1/logs", fmt.Sprintf(logBody, tc.resource, tc.record), tc.headers)
 			if status != tc.wantStatus {
 				t.Fatalf("status = %d (%s), want %d", status, body, tc.wantStatus)
 			}
 			// Error bodies go back to the producer; none may echo a credential.
 			for _, k := range tc.headers {
-				if strings.Contains(body, strings.TrimPrefix(k, "Bearer ")) {
+				if strings.Contains(body, strings.TrimPrefix(k, "Bearer ")) && strings.HasPrefix(strings.TrimPrefix(k, "Bearer "), "tk_") {
 					t.Fatalf("response %q echoes a supplied credential", body)
 				}
 			}
 			if status != 200 {
 				return
 			}
-			accepted++
-			got, _ := readExported(t, outFile, accepted)
-			rec := got[accepted-1]
-			if rec.resource["toudai.workspace_id"] != tc.wantWS || rec.resource["toudai.dataset"] != tc.wantDS || rec.resource["toudai.scope_source"] != "gateway" {
-				t.Fatalf("resource = %v, want workspace %s dataset %s", rec.resource, tc.wantWS, tc.wantDS)
+			g.accepted++
+			got, _ := readExported(t, g.outFile, g.accepted)
+			rec := got[g.accepted-1]
+			if rec.resource["toudai.dataset"] != tc.wantDS {
+				t.Fatalf("resource = %v, want dataset %s", rec.resource, tc.wantDS)
+			}
+			for _, retired := range []string{"toudai.workspace_id", "toudai.scope_source"} {
+				if _, ok := rec.resource[retired]; ok {
+					t.Fatalf("resource carries retired %s: %v", retired, rec.resource)
+				}
 			}
 			if id, err := uuid.Parse(rec.record["toudai.event_id"]); err != nil || id.Version() != 7 {
 				t.Fatalf("event_id = %q, want a UUIDv7 (%v)", rec.record["toudai.event_id"], err)
@@ -271,22 +299,24 @@ func TestGatewayIngestion(t *testing.T) {
 	// have been written anywhere an exporter could store it.
 	// Accepted requests reach the file exporter synchronously and rejected ones
 	// never leave the processor, so the file is complete once the responses are in.
-	got, raw := readExported(t, outFile, 0)
-	if len(got) != accepted {
-		t.Fatalf("exporter received %d records, want only the %d accepted", len(got), accepted)
-	}
-	if strings.Contains(raw, "tk_example") {
-		t.Fatal("an ingestion key reached exported data")
+	for def, g := range gateways {
+		got, raw := readExported(t, g.outFile, 0)
+		if len(got) != g.accepted {
+			t.Fatalf("default %q: exporter received %d records, want only the %d accepted", def, len(got), g.accepted)
+		}
+		if strings.Contains(raw, "tk_example") {
+			t.Fatal("an ingestion key reached exported data")
+		}
 	}
 }
 
 // A producer retry of an identical request is a new request and gets new IDs;
 // two identical records inside one request do too. Nothing is deduplicated.
 func TestGatewayAssignsDistinctIDsToIdenticalEvents(t *testing.T) {
-	base, _, outFile := gateway(t)
+	base, _, outFile := gateway(t, "")
 	record := `{"timeUnixNano":"1","body":{"stringValue":"same"}}`
 	body := `{"resourceLogs":[{"scopeLogs":[{"logRecords":[` + record + `,` + record + `]}]}]}`
-	hdr := map[string]string{"X-Toudai-Key": keyWSAProd}
+	hdr := map[string]string{"X-Toudai-Key": keyProd}
 	for i := 0; i < 2; i++ {
 		if status, resp := post(t, base+"/v1/logs", body, hdr); status != 200 {
 			t.Fatalf("attempt %d: status = %d (%s)", i+1, status, resp)
@@ -307,24 +337,24 @@ func TestGatewayAssignsDistinctIDsToIdenticalEvents(t *testing.T) {
 }
 
 func TestGatewayTraces(t *testing.T) {
-	base, _, outFile := gateway(t)
+	base, _, outFile := gateway(t, "staging")
 	body := `{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"0102030405060708090a0b0c0d0e0f10","spanId":"0102030405060708","name":"s","startTimeUnixNano":"1","endTimeUnixNano":"2"}]}]}]}`
-	if status, resp := post(t, base+"/v1/traces", body, map[string]string{"X-Toudai-Key": keyWSBProd}); status != 200 {
+	if status, resp := post(t, base+"/v1/traces", body, map[string]string{"X-Toudai-Key": keyAny}); status != 200 {
 		t.Fatalf("status = %d (%s)", status, resp)
 	}
 	if status, _ := post(t, base+"/v1/traces", body, nil); status != 401 {
 		t.Fatalf("keyless status = %d, want 401", status)
 	}
 	got, _ := readExported(t, outFile, 1)
-	if len(got) != 1 || got[0].resource["toudai.workspace_id"] != wsB || got[0].record["toudai.event_id"] == "" {
-		t.Fatalf("exported = %+v, want one span scoped to %s with an event_id", got, wsB)
+	if len(got) != 1 || got[0].resource["toudai.dataset"] != "staging" || got[0].record["toudai.event_id"] == "" {
+		t.Fatalf("exported = %+v, want one span in the default dataset staging with an event_id", got)
 	}
 }
 
 // The example config enables gRPC with the same authenticator; gRPC lowercases
 // metadata keys, so this exercises the extension's case-insensitive lookup.
 func TestGatewayGRPC(t *testing.T) {
-	_, addr, outFile := gateway(t)
+	_, addr, outFile := gateway(t, "")
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
@@ -341,10 +371,11 @@ func TestGatewayGRPC(t *testing.T) {
 		md       metadata.MD
 		wantCode codes.Code
 	}{
-		{"accepted", metadata.Pairs("x-toudai-key", keyWSAProd), codes.OK},
+		{"accepted", metadata.Pairs("x-toudai-key", keyTwo, "x-toudai-dataset", "staging"), codes.OK},
 		{"missing key", metadata.MD{}, codes.Unauthenticated},
 		{"unknown key", metadata.Pairs("x-toudai-key", "tk_example_not_a_real_key_000"), codes.Unauthenticated},
-		{"unknown dataset", metadata.Pairs("x-toudai-key", keyWSAProd, "x-toudai-dataset", "nope"), codes.PermissionDenied},
+		{"dataset outside the key's list", metadata.Pairs("x-toudai-key", keyProd, "x-toudai-dataset", "nope"), codes.PermissionDenied},
+		{"no dataset and no default", metadata.Pairs("x-toudai-key", keyTwo), codes.InvalidArgument},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -357,7 +388,7 @@ func TestGatewayGRPC(t *testing.T) {
 		})
 	}
 	got, _ := readExported(t, outFile, 1)
-	if len(got) != 1 || got[0].resource["toudai.workspace_id"] != wsA {
-		t.Fatalf("exported = %+v, want one record scoped to %s", got, wsA)
+	if len(got) != 1 || got[0].resource["toudai.dataset"] != "staging" {
+		t.Fatalf("exported = %+v, want one record in dataset staging", got)
 	}
 }

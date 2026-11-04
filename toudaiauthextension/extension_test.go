@@ -13,23 +13,21 @@ import (
 )
 
 const (
-	keyA     = "tk_test_workspace_a_0123456789"
-	keyB     = "tk_test_workspace_b_0123456789"
+	keyA     = "tk_test_two_datasets_0123456789"
+	keyB     = "tk_test_one_dataset_0123456789"
+	keyAny   = "tk_test_any_dataset_0123456789"
 	keyRO    = "tk_test_read_only_0123456789"
-	wsA      = "11111111-1111-4111-8111-111111111111"
-	wsB      = "22222222-2222-4222-8222-222222222222"
 	keysYAML = `
 keys:
   ` + keyA + `:
-    workspace_id: ` + wsA + `
     datasets: [prod, staging]
     write: true
   ` + keyB + `:
-    workspace_id: ` + wsB + `
     datasets: [prod]
     write: true
+  ` + keyAny + `:
+    write: true
   ` + keyRO + `:
-    workspace_id: ` + wsA + `
     datasets: [prod]
     write: false
 `
@@ -50,25 +48,27 @@ func newTestExtension(t *testing.T) *authExtension {
 
 func TestAuthenticate(t *testing.T) {
 	tests := []struct {
-		name        string
-		headers     map[string][]string
-		wantErr     error
-		wantWS      string
-		wantDataset string
+		name         string
+		headers      map[string][]string
+		wantErr      error
+		wantDatasets []string // nil: unrestricted
+		wantDataset  string
 	}{
-		{"accepted", map[string][]string{"X-Toudai-Key": {keyA}}, nil, wsA, ""},
-		{"header names are case-insensitive", map[string][]string{"x-toudai-key": {keyB}, "X-TOUDAI-DATASET": {"prod"}}, nil, wsB, "prod"},
-		{"surrounding whitespace is trimmed", map[string][]string{"X-Toudai-Key": {"  " + keyA + " "}}, nil, wsA, ""},
-		{"requested dataset is passed through unchecked", map[string][]string{"X-Toudai-Key": {keyA}, "X-Toudai-Dataset": {"nope"}}, nil, wsA, "nope"},
-		{"missing key", map[string][]string{"X-Toudai-Dataset": {"prod"}}, errMissingKey, "", ""},
-		{"no headers", nil, errMissingKey, "", ""},
-		{"empty key", map[string][]string{"X-Toudai-Key": {"  "}}, errMissingKey, "", ""},
-		{"unknown key", map[string][]string{"X-Toudai-Key": {"tk_test_not_a_real_key_000"}}, errInvalidKey, "", ""},
-		{"key is a prefix of a real key", map[string][]string{"X-Toudai-Key": {keyA[:len(keyA)-1]}}, errInvalidKey, "", ""},
-		{"authorization header is not the key", map[string][]string{"Authorization": {"Bearer " + keyA}}, errMissingKey, "", ""},
-		{"read-only key", map[string][]string{"X-Toudai-Key": {keyRO}}, errNoWrite, "", ""},
-		{"two key headers", map[string][]string{"X-Toudai-Key": {keyA, keyB}}, errMultipleKeys, "", ""},
-		{"two dataset headers", map[string][]string{"X-Toudai-Key": {keyA}, "X-Toudai-Dataset": {"prod", "staging"}}, errMultipleScopes, "", ""},
+		{"accepted", map[string][]string{"X-Toudai-Key": {keyA}}, nil, []string{"prod", "staging"}, ""},
+		{"header names are case-insensitive", map[string][]string{"x-toudai-key": {keyB}, "X-TOUDAI-DATASET": {"prod"}}, nil, []string{"prod"}, "prod"},
+		{"surrounding whitespace is trimmed", map[string][]string{"X-Toudai-Key": {"  " + keyA + " "}}, nil, []string{"prod", "staging"}, ""},
+		{"key without a dataset list is unrestricted", map[string][]string{"X-Toudai-Key": {keyAny}}, nil, nil, ""},
+		{"requested dataset is passed through unchecked", map[string][]string{"X-Toudai-Key": {keyA}, "X-Toudai-Dataset": {"nope"}}, nil, []string{"prod", "staging"}, "nope"},
+		{"missing key", map[string][]string{"X-Toudai-Dataset": {"prod"}}, errMissingKey, nil, ""},
+		{"no headers", nil, errMissingKey, nil, ""},
+		{"empty key", map[string][]string{"X-Toudai-Key": {"  "}}, errMissingKey, nil, ""},
+		{"unknown key", map[string][]string{"X-Toudai-Key": {"tk_test_not_a_real_key_000"}}, errInvalidKey, nil, ""},
+		{"key is a prefix of a real key", map[string][]string{"X-Toudai-Key": {keyA[:len(keyA)-1]}}, errInvalidKey, nil, ""},
+		{"authorization header is not the key", map[string][]string{"Authorization": {"Bearer " + keyA}}, errMissingKey, nil, ""},
+		{"read-only key", map[string][]string{"X-Toudai-Key": {keyRO}}, errNoWrite, nil, ""},
+		{"two key headers", map[string][]string{"X-Toudai-Key": {keyA, keyB}}, errMultipleKeys, nil, ""},
+		{"two dataset headers", map[string][]string{"X-Toudai-Key": {keyA}, "X-Toudai-Dataset": {"prod", "staging"}}, errMultipleDatasets, nil, ""},
+		{"blank dataset header", map[string][]string{"X-Toudai-Key": {keyA}, "X-Toudai-Dataset": {"  "}}, errEmptyDataset, nil, ""},
 	}
 	ext := newTestExtension(t)
 	for _, tc := range tests {
@@ -91,11 +91,14 @@ func TestAuthenticate(t *testing.T) {
 				return
 			}
 			auth := client.FromContext(ctx).Auth
-			if got := auth.GetAttribute(AttrWorkspaceID); got != tc.wantWS {
-				t.Fatalf("workspace = %v, want %s", got, tc.wantWS)
+			if got, _ := auth.GetAttribute(AttrDatasets).([]string); !slices.Equal(got, tc.wantDatasets) || (got == nil) != (tc.wantDatasets == nil) {
+				t.Fatalf("datasets = %#v, want %#v", got, tc.wantDatasets)
 			}
 			if got, _ := auth.GetAttribute(AttrRequestedDataset).(string); got != tc.wantDataset {
 				t.Fatalf("requested dataset = %q, want %q", got, tc.wantDataset)
+			}
+			if auth.GetAttribute(AttrAuthenticator) != AuthenticatorName {
+				t.Fatal("auth data is not marked as toudaiauth's")
 			}
 			if auth.GetAttribute(AttrWrite) != true {
 				t.Fatal("write permission missing from auth data")
@@ -205,7 +208,6 @@ func TestParseKeyStore(t *testing.T) {
 	const ok = `
 keys:
   tk_test_valid_key_0123456789:
-    workspace_id: ws-1
     datasets: [a]
     write: true
 `
@@ -215,17 +217,17 @@ keys:
 		wantErr string
 	}{
 		{"valid", ok, ""},
-		{"two keys for one workspace", ok + `
+		{"two keys", ok + `
   tk_test_second_key_0123456789:
-    workspace_id: ws-1
     datasets: [a, b]
     write: true
 `, ""},
+		{"no dataset list", strings.Replace(ok, "    datasets: [a]\n", "", 1), ""},
+		{"empty dataset list", strings.Replace(ok, "datasets: [a]", "datasets: []", 1), "datasets is empty"},
 		{"no keys", "keys: {}\n", "defines no keys"},
 		{"short key", strings.Replace(ok, "tk_test_valid_key_0123456789", "short", 1), "shorter than"},
-		{"missing workspace", strings.Replace(ok, "workspace_id: ws-1", "workspace_id: ''", 1), "workspace_id"},
-		{"workspace with spaces", strings.Replace(ok, "ws-1", "ws 1", 1), "workspace_id"},
-		{"no datasets", strings.Replace(ok, "datasets: [a]", "datasets: []", 1), "at least one dataset"},
+		// A key file from the multi-tenant gateway must fail, not load.
+		{"retired workspace_id", strings.Replace(ok, "    write: true", "    workspace_id: ws-1\n    write: true", 1), "invalid content at line"},
 		{"bad dataset", strings.Replace(ok, "[a]", "['a b']", 1), "not a valid identifier"},
 		{"duplicate dataset", strings.Replace(ok, "[a]", "[a, a]", 1), "listed twice"},
 		{"misspelled field", strings.Replace(ok, "write:", "writes:", 1), "invalid content at line"},
