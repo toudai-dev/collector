@@ -42,4 +42,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Test
+        # e2e_test.go skips without Docker; on CI that must fail instead.
+        env:
+          TOUDAI_REQUIRE_CLICKHOUSE: "1"
         run: make test

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -29,12 +31,11 @@ const (
 	exampleKeys   = "config/keys.example.yaml"
 
 	// Synthetic keys from config/keys.example.yaml.
-	keyWSAProd     = "tk_example_ws_a_prod_0123456789abcdef"
-	keyWSAMulti    = "tk_example_ws_a_multi_0123456789abcdef"
-	keyWSBProd     = "tk_example_ws_b_prod_0123456789abcdef"
-	keyWSAReadonly = "tk_example_ws_a_readonly_0123456789ab"
-	wsA            = "11111111-1111-4111-8111-111111111111"
-	wsB            = "22222222-2222-4222-8222-222222222222"
+	keyProd     = "tk_example_prod_0123456789abcdef"
+	keyMulti    = "tk_example_multi_0123456789abcdef"
+	keyStaging  = "tk_example_staging_0123456789abcdef"
+	keyReadonly = "tk_example_readonly_0123456789abcd"
+	keyAny      = "tk_example_any_0123456789abcdef"
 )
 
 func freeAddr(t *testing.T) string {
@@ -91,6 +92,9 @@ service:
 	t.Setenv("TOUDAI_OTLP_HTTP_ENDPOINT", httpAddr)
 	t.Setenv("TOUDAI_OTLP_GRPC_ENDPOINT", grpcAddr)
 	t.Setenv("TOUDAI_KEYS_FILE", exampleKeys)
+	if _, ok := os.LookupEnv("TOUDAI_DEFAULT_DATASET"); !ok {
+		t.Setenv("TOUDAI_DEFAULT_DATASET", "")
+	}
 
 	set := collectorSettings()
 	set.DisableGracefulShutdown = true
@@ -213,7 +217,7 @@ func asStrings(m map[string]any) map[string]string {
 }
 
 // Through the real receiver, auth extension, and gateway processor from the
-// example config: what is accepted carries key-derived scope and fresh IDs, and
+// example config: what is accepted carries a key-checked dataset and fresh IDs, and
 // everything else is refused with the right status and writes nothing.
 func TestGatewayIngestion(t *testing.T) {
 	base, _, outFile := gateway(t)
@@ -223,22 +227,27 @@ func TestGatewayIngestion(t *testing.T) {
 		resource   string // extra resource attributes (JSON list items, leading comma)
 		record     string
 		wantStatus int
-		wantWS     string
 		wantDS     string
 	}{
-		{"accepted, single-dataset key", map[string]string{"X-Toudai-Key": keyWSAProd}, "", "", 200, wsA, "prod"},
-		{"accepted, other workspace", map[string]string{"X-Toudai-Key": keyWSBProd}, "", "", 200, wsB, "prod"},
-		{"accepted, multi-dataset key names its dataset", map[string]string{"X-Toudai-Key": keyWSAMulti, "X-Toudai-Dataset": "staging"}, "", "", 200, wsA, "staging"},
-		{"unknown dataset", map[string]string{"X-Toudai-Key": keyWSAMulti, "X-Toudai-Dataset": "nope"}, "", "", 403, "", ""},
-		{"dataset belonging only to another key", map[string]string{"X-Toudai-Key": keyWSBProd, "X-Toudai-Dataset": "staging"}, "", "", 403, "", ""},
-		{"multi-dataset key without a dataset", map[string]string{"X-Toudai-Key": keyWSAMulti}, "", "", 400, "", ""},
-		{"override attempt: workspace on resource", map[string]string{"X-Toudai-Key": keyWSAProd}, `,{"key":"toudai.workspace_id","value":{"stringValue":"` + wsB + `"}}`, "", 400, "", ""},
-		{"override attempt: dataset on resource", map[string]string{"X-Toudai-Key": keyWSAProd}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 400, "", ""},
-		{"override attempt: forged scope marker", map[string]string{"X-Toudai-Key": keyWSAProd}, `,{"key":"toudai.scope_source","value":{"stringValue":"gateway"}}`, "", 400, "", ""},
-		{"missing key", nil, "", "", 401, "", ""},
-		{"unknown key", map[string]string{"X-Toudai-Key": "tk_example_not_a_real_key_000"}, "", "", 401, "", ""},
-		{"read-only key", map[string]string{"X-Toudai-Key": keyWSAReadonly}, "", "", 401, "", ""},
-		{"authorization header is not an ingestion key", map[string]string{"Authorization": "Bearer " + keyWSAProd}, "", "", 401, "", ""},
+		{"accepted, single-dataset key", map[string]string{"X-Toudai-Key": keyProd}, "", "", 200, "prod"},
+		{"accepted, other single-dataset key", map[string]string{"X-Toudai-Key": keyStaging}, "", "", 200, "staging"},
+		{"accepted, multi-dataset key names its dataset", map[string]string{"X-Toudai-Key": keyMulti, "X-Toudai-Dataset": "staging"}, "", "", 200, "staging"},
+		{"unknown dataset", map[string]string{"X-Toudai-Key": keyMulti, "X-Toudai-Dataset": "nope"}, "", "", 403, ""},
+		{"dataset belonging only to another key", map[string]string{"X-Toudai-Key": keyProd, "X-Toudai-Dataset": "staging"}, "", "", 403, ""},
+		{"multi-dataset key without a dataset", map[string]string{"X-Toudai-Key": keyMulti}, "", "", 400, ""},
+		{"key without a dataset list names any dataset", map[string]string{"X-Toudai-Key": keyAny, "X-Toudai-Dataset": "canary"}, "", "", 200, "canary"},
+		{"key without a dataset list and no default", map[string]string{"X-Toudai-Key": keyAny}, "", "", 400, ""},
+		{"invalid dataset name", map[string]string{"X-Toudai-Key": keyAny, "X-Toudai-Dataset": "a b"}, "", "", 400, ""},
+		{"resource dataset equal to the resolved one", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.dataset","value":{"stringValue":"prod"}}`, "", 200, "prod"},
+		{"resource dataset outside the key's list", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 403, ""},
+		{"resource dataset permitted but not the requested one", map[string]string{"X-Toudai-Key": keyMulti, "X-Toudai-Dataset": "prod"}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 400, ""},
+		{"producer event_id on a record", map[string]string{"X-Toudai-Key": keyProd}, "", `{"key":"toudai.event_id","value":{"stringValue":"00000000-0000-7000-8000-000000000000"}}`, 400, ""},
+		{"retired workspace attribute on resource", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.workspace_id","value":{"stringValue":"ws"}}`, "", 400, ""},
+		{"retired scope marker on resource", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.scope_source","value":{"stringValue":"gateway"}}`, "", 400, ""},
+		{"missing key", nil, "", "", 401, ""},
+		{"unknown key", map[string]string{"X-Toudai-Key": "tk_example_not_a_real_key_000"}, "", "", 401, ""},
+		{"read-only key", map[string]string{"X-Toudai-Key": keyReadonly}, "", "", 401, ""},
+		{"authorization header is not an ingestion key", map[string]string{"Authorization": "Bearer " + keyProd}, "", "", 401, ""},
 	}
 	accepted := 0
 	for _, tc := range tests {
@@ -259,8 +268,10 @@ func TestGatewayIngestion(t *testing.T) {
 			accepted++
 			got, _ := readExported(t, outFile, accepted)
 			rec := got[accepted-1]
-			if rec.resource["toudai.workspace_id"] != tc.wantWS || rec.resource["toudai.dataset"] != tc.wantDS || rec.resource["toudai.scope_source"] != "gateway" {
-				t.Fatalf("resource = %v, want workspace %s dataset %s", rec.resource, tc.wantWS, tc.wantDS)
+			// The dataset is the only scope on the wire (Decision 0002 D2).
+			want := map[string]string{"service.name": "svc", "toudai.dataset": tc.wantDS}
+			if !maps.Equal(rec.resource, want) {
+				t.Fatalf("resource = %v, want %v", rec.resource, want)
 			}
 			if id, err := uuid.Parse(rec.record["toudai.event_id"]); err != nil || id.Version() != 7 {
 				t.Fatalf("event_id = %q, want a UUIDv7 (%v)", rec.record["toudai.event_id"], err)
@@ -286,7 +297,7 @@ func TestGatewayAssignsDistinctIDsToIdenticalEvents(t *testing.T) {
 	base, _, outFile := gateway(t)
 	record := `{"timeUnixNano":"1","body":{"stringValue":"same"}}`
 	body := `{"resourceLogs":[{"scopeLogs":[{"logRecords":[` + record + `,` + record + `]}]}]}`
-	hdr := map[string]string{"X-Toudai-Key": keyWSAProd}
+	hdr := map[string]string{"X-Toudai-Key": keyProd}
 	for i := 0; i < 2; i++ {
 		if status, resp := post(t, base+"/v1/logs", body, hdr); status != 200 {
 			t.Fatalf("attempt %d: status = %d (%s)", i+1, status, resp)
@@ -309,15 +320,45 @@ func TestGatewayAssignsDistinctIDsToIdenticalEvents(t *testing.T) {
 func TestGatewayTraces(t *testing.T) {
 	base, _, outFile := gateway(t)
 	body := `{"resourceSpans":[{"scopeSpans":[{"spans":[{"traceId":"0102030405060708090a0b0c0d0e0f10","spanId":"0102030405060708","name":"s","startTimeUnixNano":"1","endTimeUnixNano":"2"}]}]}]}`
-	if status, resp := post(t, base+"/v1/traces", body, map[string]string{"X-Toudai-Key": keyWSBProd}); status != 200 {
+	if status, resp := post(t, base+"/v1/traces", body, map[string]string{"X-Toudai-Key": keyStaging}); status != 200 {
 		t.Fatalf("status = %d (%s)", status, resp)
 	}
 	if status, _ := post(t, base+"/v1/traces", body, nil); status != 401 {
 		t.Fatalf("keyless status = %d, want 401", status)
 	}
 	got, _ := readExported(t, outFile, 1)
-	if len(got) != 1 || got[0].resource["toudai.workspace_id"] != wsB || got[0].record["toudai.event_id"] == "" {
-		t.Fatalf("exported = %+v, want one span scoped to %s with an event_id", got, wsB)
+	if len(got) != 1 || got[0].resource["toudai.dataset"] != "staging" || got[0].record["toudai.event_id"] == "" {
+		t.Fatalf("exported = %+v, want one span in dataset staging with an event_id", got)
+	}
+}
+
+// With default_dataset set, a request the header and key leave unresolved lands
+// in the default, and the default is still held to the key's list.
+func TestGatewayDefaultDataset(t *testing.T) {
+	t.Setenv("TOUDAI_DEFAULT_DATASET", "staging")
+	base, _, outFile := gateway(t)
+	body := fmt.Sprintf(logBody, "", "")
+	tests := []struct {
+		name       string
+		key        string
+		wantStatus int
+	}{
+		{"key without a dataset list", keyAny, 200},
+		{"multi-dataset key that permits the default", keyMulti, 200},
+		{"single-dataset key keeps its own dataset", keyProd, 200},
+	}
+	for _, tc := range tests {
+		if status, resp := post(t, base+"/v1/logs", body, map[string]string{"X-Toudai-Key": tc.key}); status != tc.wantStatus {
+			t.Fatalf("%s: status = %d (%s), want %d", tc.name, status, resp, tc.wantStatus)
+		}
+	}
+	got, _ := readExported(t, outFile, 3)
+	var datasets []string
+	for _, r := range got {
+		datasets = append(datasets, r.resource["toudai.dataset"])
+	}
+	if !slices.Equal(datasets, []string{"staging", "staging", "prod"}) {
+		t.Fatalf("datasets = %v, want [staging staging prod]", datasets)
 	}
 }
 
@@ -341,10 +382,10 @@ func TestGatewayGRPC(t *testing.T) {
 		md       metadata.MD
 		wantCode codes.Code
 	}{
-		{"accepted", metadata.Pairs("x-toudai-key", keyWSAProd), codes.OK},
+		{"accepted", metadata.Pairs("x-toudai-key", keyProd), codes.OK},
 		{"missing key", metadata.MD{}, codes.Unauthenticated},
 		{"unknown key", metadata.Pairs("x-toudai-key", "tk_example_not_a_real_key_000"), codes.Unauthenticated},
-		{"unknown dataset", metadata.Pairs("x-toudai-key", keyWSAProd, "x-toudai-dataset", "nope"), codes.PermissionDenied},
+		{"unknown dataset", metadata.Pairs("x-toudai-key", keyProd, "x-toudai-dataset", "nope"), codes.PermissionDenied},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -357,7 +398,7 @@ func TestGatewayGRPC(t *testing.T) {
 		})
 	}
 	got, _ := readExported(t, outFile, 1)
-	if len(got) != 1 || got[0].resource["toudai.workspace_id"] != wsA {
-		t.Fatalf("exported = %+v, want one record scoped to %s", got, wsA)
+	if len(got) != 1 || got[0].resource["toudai.dataset"] != "prod" {
+		t.Fatalf("exported = %+v, want one record in dataset prod", got)
 	}
 }

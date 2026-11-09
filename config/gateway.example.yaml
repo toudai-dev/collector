@@ -1,20 +1,22 @@
-# Product gateway: OTLP in, key-derived trusted scope, gateway-assigned event
-# IDs, owned toudai exporter out.
+# Product gateway: OTLP in, key-checked dataset, gateway-assigned event IDs,
+# owned toudai exporter out.
 #
-# Producers send an ingestion key in the X-Toudai-Key header (and, for a key
-# scoped to several datasets, the dataset in X-Toudai-Dataset):
+# Producers send an ingestion key in the X-Toudai-Key header and may name the
+# dataset in X-Toudai-Dataset. Without the header, the dataset is the key's only
+# dataset, else the processor's default_dataset (Decision 0002 D3):
 #
 #   curl -H 'X-Toudai-Key: <key>' -H 'Content-Type: application/json' \
 #        --data @logs.json http://localhost:4318/v1/logs
 #
 # Responses: 401 for a missing, unknown, or read-only key (authentication fails
-# before any pipeline runs); 403 for a dataset the key does not permit; 400 for a
-# missing dataset on a multi-dataset key or a request that sets reserved toudai.*
-# resource attributes. None are retryable.
+# before any pipeline runs); 403 for a dataset the key does not permit, from any
+# source; 400 for a request whose dataset cannot be resolved or is not a valid
+# name, a resource toudai.dataset that differs from the resolved dataset, any
+# other reserved toudai.* resource attribute, or a record or span carrying its
+# own toudai.event_id. None are retryable.
 #
-# Workspace and dataset come only from the key (toudaiauth + toudaigateway).
-# There is deliberately no static resource processor and no routing connector:
-# a pipeline's scope must not be configured per workspace.
+# The dataset is checked against the key (toudaiauth + toudaigateway). There is
+# no workspace or tenant: one deployment serves one customer (Decision 0002).
 
 extensions:
   toudaiauth:
@@ -33,13 +35,16 @@ receivers:
           authenticator: toudaiauth
 
 processors:
-  # Injects toudai.workspace_id / toudai.dataset / toudai.scope_source from the
-  # authenticated key and assigns every record its event_id. It must stay ahead
+  # Sets toudai.dataset from the authenticated request and assigns every record
+  # its event_id. It must stay ahead
   # of anything that batches: scope is per request and a batch can mix requests.
   # Batching in this distribution is the exporter's sending_queue batch below,
   # which runs after the processor; if a batch processor is ever added, list it
   # after toudaigateway.
-  toudaigateway: {}
+  toudaigateway:
+    # Empty means no default: a request the header and key do not resolve is a
+    # 400. A default is still checked against the key's dataset list.
+    default_dataset: ${env:TOUDAI_DEFAULT_DATASET:-}
 
 exporters:
   toudai:

@@ -24,35 +24,59 @@ which were used for stock-path probes; they can be dropped once nothing needs th
 
 The `toudai` exporter (package `toudaiexporter`) validates a whole export request, writes
 the canonical payload row, then the serving row. Queue, retry, and timeout come from
-`exporterhelper`. Serving rows use the `tenant_id` and `timestamp` columns and carry a
-`routing_epoch` stamp, configurable with `routing_epoch` (default `1`).
+`exporterhelper`. Rows carry no tenant column: one deployment database holds one customer's
+data, and `dataset` is the only scope a row has (Decision 0002). Serving rows use the
+`timestamp` column and carry a `routing_epoch` stamp, configurable with `routing_epoch`
+(default `1`).
 
-The exporter relies on a gateway pipeline that injects the trusted `toudai.workspace_id`,
-`toudai.dataset`, and `toudai.scope_source` resource attributes and a `toudai.event_id` on every
-record before it (see Gateway). It writes the assigned `event_id` as is; a missing or non-UUIDv7
-ID fails the whole export as a permanent error. Nothing is deduplicated (Decision 0001 D5).
+The database is deployment configuration: `database` (default `toudai`; the example gateway
+reads `TOUDAI_CLICKHOUSE_DATABASE`) must name the database the DDL was applied to.
+
+The exporter relies on a gateway pipeline that sets the `toudai.dataset` resource attribute and
+a `toudai.event_id` on every record before it (see Gateway). A resource without a dataset fails
+the whole export as a permanent error. It writes the assigned `event_id` as is; a missing or
+non-UUIDv7 ID also fails the whole export. Nothing is deduplicated (Decision 0001 D5).
 
 `testdata/schema/` vendors the ClickHouse DDL from `toudai-dev/toudai`; a test fails when the
-exporter's INSERT columns drift from it. Each file's header names the source commit.
+exporter's INSERT columns drift from it. Each file's header names the source commit. The DDL
+names the database as the `{database:Identifier}` query parameter, so apply it with the same
+name the exporter uses, for example
+`clickhouse-client --param_database="${TOUDAI_CLICKHOUSE_DATABASE:-toudai}" --multiquery < file.sql`
+for each file in order (upstream `clickhouse/apply-schema.sh` does exactly this).
 
 ## Gateway
 
 `config/gateway.example.yaml` is the product gateway pipeline: OTLP in, `toudaiauth` and
-`toudaigateway` ahead of any batching, the `toudai` exporter out.
+`toudaigateway` ahead of any batching, the `toudai` exporter out. There is no workspace or tenant:
+one deployment serves one customer, and accounts, workspaces, and the mapping of keys to customers
+belong to a private control plane (Decision 0002).
 
 - **`toudaiauth` extension** validates an ingestion key from the `X-Toudai-Key` header against a
-  static key file (`config/keys.example.yaml`) that maps each key to a `workspace_id`, its allowed
-  datasets, and write permission. A missing, unknown, or read-only key is a 401 before any
-  pipeline runs. The key is held as a digest, removed from receiver metadata, and never appears in
-  auth data, errors, or exported data. Rotation and revocation are file edits plus a restart.
-- **`toudaigateway` processor** sets `toudai.workspace_id`, `toudai.dataset`, and
-  `toudai.scope_source` from the key. The dataset is the `X-Toudai-Dataset` header, or the key's
-  only dataset; a dataset outside the key's list is a 403. A resource that carries any
-  `toudai.*` attribute is a 400. It assigns every log record and span a random UUIDv7 `event_id`,
-  so a producer retry or an identical event always gets a new one.
+  static key file (`config/keys.example.yaml`) that maps each key to its write permission and an
+  optional list of allowed datasets; a key without a list may write to any dataset. A missing,
+  unknown, or read-only key is a 401 before any pipeline runs. The key is held as a digest,
+  removed from receiver metadata, and never appears in auth data, errors, or exported data.
+  Rotation and revocation are file edits plus a restart.
+- **`toudaigateway` processor** resolves and sets `toudai.dataset`: the `X-Toudai-Dataset`
+  header, else the key's only dataset, else the configured `default_dataset` (none by default).
+  A dataset outside the key's list is a 403, whichever source it came from; an unresolved or
+  invalid dataset name is a 400. A producer `toudai.dataset` on the resource is accepted only when
+  it equals the resolved dataset (403 when outside the key's list, else 400); any other
+  `toudai.*` resource attribute is a 400. It assigns every log record and span a random UUIDv7
+  `event_id`, so a producer retry or an identical event always gets a new one; a record or span
+  that already carries `toudai.event_id` is a 400 for the whole request (Decision 0002 D3).
 
-Scope never comes from pipeline configuration, so there is no per-workspace resource processor or
-routing connector. `main_test.go` runs the example through the real receivers over HTTP and gRPC.
+Dataset resolution is write-side only. The query service takes the dataset explicitly from each
+query and checks it against the read key's optional list.
+
+`main_test.go` runs the example through the real receivers over HTTP and gRPC.
+
+`e2e_test.go` runs the example gateway with the `toudai` exporter against a
+`clickhouse/clickhouse-server:26.8.2.7` container: it applies the vendored DDL to a custom database
+with `--param_database`, checks dataset precedence, key restrictions, and rejections as stored
+rows, and checks that no tenant column, retired attribute, or key reaches ClickHouse or the
+collector log. It is skipped without a Docker daemon; `TOUDAI_REQUIRE_CLICKHOUSE=1` turns that
+into a failure.
 
 ## License
 

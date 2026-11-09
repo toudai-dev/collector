@@ -45,7 +45,7 @@ func components() (otelcol.Factories, error) {
 	}
 	if factories.Processors, err = otelcol.MakeFactoryMap(
 		resourceprocessor.NewFactory(),
-		// The product gateway processor injects key-derived scope and event IDs;
+		// The product gateway processor sets a key-checked dataset and event IDs;
 		// the stock resource processor remains for probes with static scope.
 		toudaigatewayprocessor.NewFactory(),
 		// The stock transform processor is included so the stock write-path probe
