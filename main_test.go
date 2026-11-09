@@ -241,6 +241,7 @@ func TestGatewayIngestion(t *testing.T) {
 		{"resource dataset equal to the resolved one", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.dataset","value":{"stringValue":"prod"}}`, "", 200, "prod"},
 		{"resource dataset outside the key's list", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 403, ""},
 		{"resource dataset permitted but not the requested one", map[string]string{"X-Toudai-Key": keyMulti, "X-Toudai-Dataset": "prod"}, `,{"key":"toudai.dataset","value":{"stringValue":"staging"}}`, "", 400, ""},
+		{"producer event_id on a record", map[string]string{"X-Toudai-Key": keyProd}, "", `{"key":"toudai.event_id","value":{"stringValue":"00000000-0000-7000-8000-000000000000"}}`, 400, ""},
 		{"retired workspace attribute on resource", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.workspace_id","value":{"stringValue":"ws"}}`, "", 400, ""},
 		{"retired scope marker on resource", map[string]string{"X-Toudai-Key": keyProd}, `,{"key":"toudai.scope_source","value":{"stringValue":"gateway"}}`, "", 400, ""},
 		{"missing key", nil, "", "", 401, ""},

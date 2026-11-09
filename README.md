@@ -63,8 +63,8 @@ belong to a private control plane (Decision 0002).
   invalid dataset name is a 400. A producer `toudai.dataset` on the resource is accepted only when
   it equals the resolved dataset (403 when outside the key's list, else 400); any other
   `toudai.*` resource attribute is a 400. It assigns every log record and span a random UUIDv7
-  `event_id`, replacing any producer `toudai.event_id`, so a producer retry or an identical
-  event always gets a new one.
+  `event_id`, so a producer retry or an identical event always gets a new one; a record or span
+  that already carries `toudai.event_id` is a 400 for the whole request (Decision 0002 D3).
 
 Dataset resolution is write-side only. The query service takes the dataset explicitly from each
 query and checks it against the read key's optional list.

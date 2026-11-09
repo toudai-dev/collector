@@ -32,6 +32,7 @@ var (
 	errUnknownDataset   = reject(codes.PermissionDenied, "dataset is not permitted for this ingestion key")
 	errDatasetMismatch  = reject(codes.InvalidArgument, "resource toudai.dataset does not match the request's dataset")
 	errReservedResource = reject(codes.InvalidArgument, "resource attribute in the reserved toudai. namespace is not accepted from producers")
+	errProducerEventID  = reject(codes.InvalidArgument, "record attribute toudai.event_id is assigned by the gateway and is not accepted from producers")
 )
 
 // rejection is a permanent error that maps to a specific client-visible status.
@@ -152,22 +153,36 @@ func checkResource(attrs pcommon.Map, sc scope) error {
 }
 
 func (g *gateway) stampResource(attrs pcommon.Map, sc scope) {
-	// RemoveIf for the same reason as in stampEvent: a matching producer value
-	// may appear more than once on the wire.
+	// RemoveIf rather than a plain upsert: an OTLP map can carry duplicate keys,
+	// and a matching producer value may appear more than once on the wire.
 	attrs.RemoveIf(func(k string, _ pcommon.Value) bool { return k == reserved.DatasetAttr })
 	attrs.PutStr(reserved.DatasetAttr, sc.dataset)
 }
 
-// stampEvent assigns the record's event_id, replacing anything the producer sent
-// under the same key.
+// checkEvent rejects a record or span that carries its own event_id. Identity
+// is the gateway's alone, and Decision 0002 D3 rejects a producer value rather
+// than overwriting it, so a producer relying on its own IDs finds out instead
+// of silently losing them. Other toudai.* record keys are left for the
+// exporter to drop and count.
+func checkEvent(attrs pcommon.Map) error {
+	var found bool
+	attrs.Range(func(k string, _ pcommon.Value) bool {
+		found = k == reserved.EventIDAttr
+		return !found
+	})
+	if found {
+		return errProducerEventID
+	}
+	return nil
+}
+
+// stampEvent assigns the record's event_id. checkEvent has already refused any
+// producer copy, so a plain put cannot leave a duplicate behind.
 func (g *gateway) stampEvent(attrs pcommon.Map) error {
 	id, err := g.newEventID()
 	if err != nil {
 		return fmt.Errorf("assign event_id: %w", err)
 	}
-	// RemoveIf rather than a plain upsert: an OTLP map can carry duplicate keys,
-	// and an upsert would leave a producer-supplied copy behind the assigned one.
-	attrs.RemoveIf(func(k string, _ pcommon.Value) bool { return k == reserved.EventIDAttr })
 	attrs.PutStr(reserved.EventIDAttr, id)
 	return nil
 }
@@ -177,12 +192,24 @@ func (g *gateway) processLogs(ctx context.Context, ld plog.Logs) (plog.Logs, err
 	if err != nil {
 		return ld, err
 	}
-	// Validate every resource before mutating any, so a rejected request is
-	// never half-stamped.
+	// Validate every resource and record before mutating any, so a rejected
+	// request is never half-stamped. Resources go first so a dataset the key
+	// does not permit is a 403 wherever it sits in the request.
 	rls := ld.ResourceLogs()
 	for i := 0; i < rls.Len(); i++ {
 		if err := checkResource(rls.At(i).Resource().Attributes(), sc); err != nil {
 			return ld, err
+		}
+	}
+	for i := 0; i < rls.Len(); i++ {
+		rl := rls.At(i)
+		for j := 0; j < rl.ScopeLogs().Len(); j++ {
+			recs := rl.ScopeLogs().At(j).LogRecords()
+			for k := 0; k < recs.Len(); k++ {
+				if err := checkEvent(recs.At(k).Attributes()); err != nil {
+					return ld, err
+				}
+			}
 		}
 	}
 	for i := 0; i < rls.Len(); i++ {
@@ -209,6 +236,17 @@ func (g *gateway) processTraces(ctx context.Context, td ptrace.Traces) (ptrace.T
 	for i := 0; i < rss.Len(); i++ {
 		if err := checkResource(rss.At(i).Resource().Attributes(), sc); err != nil {
 			return td, err
+		}
+	}
+	for i := 0; i < rss.Len(); i++ {
+		rs := rss.At(i)
+		for j := 0; j < rs.ScopeSpans().Len(); j++ {
+			spans := rs.ScopeSpans().At(j).Spans()
+			for k := 0; k < spans.Len(); k++ {
+				if err := checkEvent(spans.At(k).Attributes()); err != nil {
+					return td, err
+				}
+			}
 		}
 	}
 	for i := 0; i < rss.Len(); i++ {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -225,42 +226,139 @@ func TestProcessLogsAssignsUniqueUUIDv7PerRecord(t *testing.T) {
 	}
 }
 
-// A producer-supplied record event ID is replaced rather than trusted, including
-// when the wire form carries the key twice, which a plain upsert would leave
-// behind the assigned one. The request is built from JSON because pcommon's API
-// cannot express duplicate keys.
-func TestProcessLogsReplacesProducerEventID(t *testing.T) {
-	const forged = "00000000-0000-7000-8000-000000000000"
-	body := `{"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"b"},"attributes":[
-		{"key":"toudai.event_id","value":{"stringValue":"` + forged + `"}},
-		{"key":"keep","value":{"stringValue":"me"}},
-		{"key":"toudai.event_id","value":{"stringValue":"` + forged + `"}},
-		{"key":"toudai.anything_else","value":{"stringValue":"x"}}]}]}]}]}`
-	ld, err := (&plog.JSONUnmarshaler{}).UnmarshalLogs([]byte(body))
-	if err != nil {
-		t.Fatal(err)
+// Decision 0002 D3: a producer-supplied toudai.event_id is rejected, not
+// overwritten, wherever it appears on a record or span, including as a
+// duplicated key or on a later resource, and the whole request is left
+// unstamped. Built from JSON because pcommon's API cannot express duplicate
+// keys.
+func TestProcessRejectsProducerEventID(t *testing.T) {
+	const forged = `{"key":"toudai.event_id","value":{"stringValue":"00000000-0000-7000-8000-000000000000"}}`
+	const keep = `{"key":"keep","value":{"stringValue":"me"}},{"key":"toudai.anything_else","value":{"stringValue":"x"}}`
+	logs := func(resources ...string) string { return `{"resourceLogs":[` + strings.Join(resources, ",") + `]}` }
+	logRes := func(records ...string) string {
+		return `{"scopeLogs":[{"logRecords":[` + strings.Join(records, ",") + `]}]}`
 	}
-	attrs := ld.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Attributes()
-	if attrs.Len() != 4 {
-		t.Fatalf("fixture has %d attributes, want the duplicate preserved (4)", attrs.Len())
+	rec := func(attrs ...string) string {
+		return `{"body":{"stringValue":"b"},"attributes":[` + strings.Join(attrs, ",") + `]}`
 	}
-	out, err := newGateway(&Config{}).processLogs(authCtx([]string{"prod"}, "", true), ld)
-	if err != nil {
-		t.Fatal(err)
+	span := func(attrs ...string) string {
+		return `{"resourceSpans":[{"scopeSpans":[{"spans":[{"name":"s"},{"name":"s","attributes":[` + strings.Join(attrs, ",") + `]}]}]}]}`
 	}
-	attrs = out.ResourceLogs().At(0).ScopeLogs().At(0).LogRecords().At(0).Attributes()
-	var ids []string
-	attrs.Range(func(k string, v pcommon.Value) bool {
-		if k == reserved.EventIDAttr {
-			ids = append(ids, v.Str())
-		}
-		return true
-	})
-	if len(ids) != 1 || ids[0] == forged {
-		t.Fatalf("event IDs = %v, want exactly one fresh gateway ID", ids)
+	tests := []struct {
+		name    string
+		logs    string // set for a logs request
+		traces  string // set for a traces request
+		wantErr error
+	}{
+		{"no producer event_id", logs(logRes(rec(keep))), "", nil},
+		{"record event_id", logs(logRes(rec(forged))), "", errProducerEventID},
+		{"duplicated record event_id", logs(logRes(rec(forged, keep, forged))), "", errProducerEventID},
+		{"event_id on a later record", logs(logRes(rec(keep), rec(keep, forged))), "", errProducerEventID},
+		{"event_id on a later resource", logs(logRes(rec(keep)), logRes(rec(forged))), "", errProducerEventID},
+		{"span event_id", "", span(forged), errProducerEventID},
+		{"span without event_id", "", span(keep), nil},
+		// Resource checks run first: a dataset outside the key's list is a 403
+		// even when an earlier record would be a 400.
+		{"event_id before a disallowed dataset", logs(logRes(rec(forged)), `{"resource":{"attributes":[{"key":"toudai.dataset","value":{"stringValue":"other"}}]},`+logRes(rec(keep))[1:]), "", errUnknownDataset},
 	}
-	if v, _ := attrs.Get("keep"); v.Str() != "me" {
-		t.Fatal("unrelated record attributes must be preserved")
+	ctx := authCtx([]string{"prod"}, "", true)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// ids collects every event_id and resource dataset in the output, so a
+			// rejected request can be checked for partial stamping.
+			var ids []string
+			var datasets, kept int
+			collect := func(res pcommon.Map, attrs []pcommon.Map) {
+				// Only the gateway writes the resolved dataset; a producer's
+				// own toudai.dataset in a test input is not stamping.
+				if v, ok := res.Get(reserved.DatasetAttr); ok && v.Str() == "prod" {
+					datasets++
+				}
+				for _, a := range attrs {
+					// Other record attributes, reserved ones included, are the
+					// exporter's to drop; the gateway leaves them alone.
+					if v, ok := a.Get("keep"); ok && v.Str() == "me" {
+						if w, ok := a.Get("toudai.anything_else"); ok && w.Str() == "x" {
+							kept++
+						}
+					}
+					a.Range(func(k string, v pcommon.Value) bool {
+						if k == reserved.EventIDAttr {
+							ids = append(ids, v.Str())
+						}
+						return true
+					})
+				}
+			}
+			var err error
+			var records int
+			if tc.logs != "" {
+				ld, uerr := (&plog.JSONUnmarshaler{}).UnmarshalLogs([]byte(tc.logs))
+				if uerr != nil {
+					t.Fatal(uerr)
+				}
+				records = ld.LogRecordCount()
+				var out plog.Logs
+				out, err = newGateway(&Config{}).processLogs(ctx, ld)
+				for i := 0; i < out.ResourceLogs().Len(); i++ {
+					rl := out.ResourceLogs().At(i)
+					var attrs []pcommon.Map
+					for j := 0; j < rl.ScopeLogs().Len(); j++ {
+						for k := 0; k < rl.ScopeLogs().At(j).LogRecords().Len(); k++ {
+							attrs = append(attrs, rl.ScopeLogs().At(j).LogRecords().At(k).Attributes())
+						}
+					}
+					collect(rl.Resource().Attributes(), attrs)
+				}
+			} else {
+				td, uerr := (&ptrace.JSONUnmarshaler{}).UnmarshalTraces([]byte(tc.traces))
+				if uerr != nil {
+					t.Fatal(uerr)
+				}
+				records = td.SpanCount()
+				var out ptrace.Traces
+				out, err = newGateway(&Config{}).processTraces(ctx, td)
+				for i := 0; i < out.ResourceSpans().Len(); i++ {
+					rs := out.ResourceSpans().At(i)
+					var attrs []pcommon.Map
+					for j := 0; j < rs.ScopeSpans().Len(); j++ {
+						for k := 0; k < rs.ScopeSpans().At(j).Spans().Len(); k++ {
+							attrs = append(attrs, rs.ScopeSpans().At(j).Spans().At(k).Attributes())
+						}
+					}
+					collect(rs.Resource().Attributes(), attrs)
+				}
+			}
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatal(err)
+				}
+				// One fresh gateway ID per record, none of them the forged value.
+				if len(ids) != records || slices.Contains(ids, "00000000-0000-7000-8000-000000000000") {
+					t.Fatalf("event IDs = %v, want %d fresh gateway IDs", ids, records)
+				}
+				if kept != 1 {
+					t.Fatalf("records keeping their own attributes = %d, want 1", kept)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) || !consumererror.IsPermanent(err) {
+				t.Fatalf("error = %v, want permanent %v", err, tc.wantErr)
+			}
+			if strings.Contains(err.Error(), "00000000-0000-7000") {
+				t.Fatalf("error %q reflects the producer value", err)
+			}
+			// Nothing stamped: only the producer's own copies remain, and no
+			// resource gained a dataset.
+			for _, id := range ids {
+				if id != "00000000-0000-7000-8000-000000000000" {
+					t.Fatalf("rejected request was assigned event ID %s", id)
+				}
+			}
+			if datasets != 0 {
+				t.Fatal("rejected request was stamped with a dataset")
+			}
+		})
 	}
 }
 
@@ -398,6 +496,7 @@ func TestRejectionsCarryClientStatuses(t *testing.T) {
 		{errInvalidDataset, codes.InvalidArgument},
 		{errDatasetMismatch, codes.InvalidArgument},
 		{errReservedResource, codes.InvalidArgument},
+		{errProducerEventID, codes.InvalidArgument},
 		{errNoWrite, codes.PermissionDenied},
 		{errNoIdentity, codes.Internal},
 	}

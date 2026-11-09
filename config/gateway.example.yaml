@@ -11,8 +11,9 @@
 # Responses: 401 for a missing, unknown, or read-only key (authentication fails
 # before any pipeline runs); 403 for a dataset the key does not permit, from any
 # source; 400 for a request whose dataset cannot be resolved or is not a valid
-# name, a resource toudai.dataset that differs from the resolved dataset, or
-# any other reserved toudai.* resource attribute. None are retryable.
+# name, a resource toudai.dataset that differs from the resolved dataset, any
+# other reserved toudai.* resource attribute, or a record or span carrying its
+# own toudai.event_id. None are retryable.
 #
 # The dataset is checked against the key (toudaiauth + toudaigateway). There is
 # no workspace or tenant: one deployment serves one customer (Decision 0002).
